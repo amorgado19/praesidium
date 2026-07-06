@@ -1,0 +1,28 @@
+# cap-core — the SOLE unsafe capability-fabrication surface (SPEC-CAP CAP-RUST-1).
+#
+# This crate is intentionally tiny and dependency-light so its entire unsafe surface can be
+# audited exhaustively. Nothing outside this crate is permitted to construct a `Cap<_, _>`.
+# If this crate grows a large dependency tree or a large public API, that is a red flag — the
+# whole security model rests on this being small and reviewable.
+
+[package]
+name         = "cap-core"
+version      = "0.0.1"
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Praesidium capability primitives — the only crate allowed to fabricate capabilities via unsafe (SPEC-CAP CAP-RUST-1)."
+
+[dependencies]
+bitflags.workspace = true          # capability rights sets
+static_assertions.workspace = true # layout tripwires on the capability representation
+
+[lints.rust]
+# cap-core is the trust root: unsafe is allowed here (it's the whole point) but must be
+# documented. Everywhere else in the workspace, unsafe should be near-absent.
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+# tighten the screws on the most safety-critical crate
+undocumented_unsafe_blocks = "warn"   # every unsafe block needs a // SAFETY: note (GC-06)

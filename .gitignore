@@ -1,0 +1,30 @@
+# Praesidium .gitignore
+
+# Rust build output
+/target
+**/target
+
+# Test assets: staged kernels, built .pex images, QEMU firmware var copies, swtpm state,
+# any downloaded/large boot artifacts. Sources for these live tracked under test/ (like Warden).
+/test-assets
+/tpm
+OVMF_VARS*.fd
+AAVMF_VARS*.fd
+*.pex
+
+# Local scratch / editor
+*.swp
+.DS_Store
+/.idea
+/.vscode
+
+# ----------------------------------------------------------------------------------------
+# Private planning docs (ACTIVE — mirrors the Warden privacy call).
+# The repo is public, but the architecture docs and standing rulebook stay local-only:
+# ADRs, specs, and build-specs (all under /docs) plus CLAUDE.md and TASKS.md are kept OUT
+# of git so they never leave this machine. Claude Code still loads CLAUDE.md/TASKS.md from
+# disk regardless of git tracking. Remove a line below to publish that file.
+# ----------------------------------------------------------------------------------------
+/docs
+CLAUDE.md
+TASKS.md

@@ -1,0 +1,62 @@
+# Praesidium — kernel workspace manifest
+# Component of the Ultio OS. Booted by Warden. See docs/adr/adr-0001 for architecture.
+
+[workspace]
+resolver = "2"
+members = [
+    "cap-core",   # SPEC-CAP CAP-RUST-1: the ONLY unsafe capability-fabrication crate
+    "abi",        # syscall ABI + .pex executable format (shared kernel <-> userspace)
+    "kernel",     # the kernel binary (bare-metal ELF, loaded by Warden's rich handoff)
+    "refproc",    # v1 reference userspace processes (the two that IPC in P7)
+    "tools",      # host-side .pex toolchain (producer / linker-objcopy-equivalent)
+    "xtask",      # host-side build/run/test harness (mirrors Warden's), dual-arch + QEMU
+]
+
+# `cargo build` at the root builds only the no_std / bare-metal members that make up the
+# kernel image. xtask and tools are HOST tools built explicitly (`cargo run -p xtask ...`),
+# and refproc builds for the userspace side of the ABI, staged separately by xtask.
+default-members = ["cap-core", "abi", "kernel"]
+
+[workspace.package]
+edition       = "2021"
+rust-version  = "1.90"          # tracked; actual channel pinned in rust-toolchain.toml (nightly)
+license       = "MIT OR Apache-2.0"
+authors       = ["Antonio (architect)"]
+repository    = "https://github.com/amorgado19/praesidium"
+
+# Shared dependency versions live here so every crate pins identically (GC-04). Members
+# reference them with `dep.workspace = true`. Kept minimal on purpose — a trust root wants
+# a small, auditable dependency surface.
+[workspace.dependencies]
+# no_std logging facade (serial-first backend lives in the kernel)
+log = { version = "0.4", default-features = false }
+# bitflags for capability rights sets (no_std)
+bitflags = { version = "2", default-features = false }
+# compile-time assertions for ABI layout tripwires (Warden-style size/offset asserts)
+static_assertions = "1.1"
+
+# ----------------------------------------------------------------------------------------
+# Profiles
+# ----------------------------------------------------------------------------------------
+
+# Release profile for the bare-metal kernel image. The *-unknown-none targets do not support
+# unwinding, so panic = "abort" is mandatory. overflow-checks stay ON in release because the
+# kernel parses hostile on-disk / on-wire structures (WardenBootInfo, .pex, FS nodes, IPC
+# messages) and a wrapping arithmetic op must TRAP into the panic handler rather than silently
+# corrupt an index or spin forever (GC-03 — same posture that hardened Warden).
+[profile.release]
+panic          = "abort"
+lto            = true
+codegen-units  = 1
+opt-level      = "s"        # size-tuned; a kernel image wants to stay lean
+overflow-checks = true      # fail-closed on integer overflow in the trust root
+strip          = false      # keep symbols for gdb-over-QEMU debugging (esp. P4/P5 wash-out phases)
+
+# Dev/test profile keeps unwinding so host unit tests (cap-core, allocator, .pex parser) can
+# run with `cargo test` on the host toolchain. The bare-metal image is always built --release.
+[profile.dev]
+panic          = "unwind"
+overflow-checks = true
+
+# The .pex toolchain and xtask are host binaries; a normal release profile is fine for them.
+# (They inherit [profile.release] above when built --release; nothing special needed.)

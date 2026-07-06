@@ -1,0 +1,33 @@
+# refproc — v1 reference userspace processes (P7).
+#
+# These are the two (or more) isolated userspace processes that communicate via capability IPC
+# to prove the ADR-0001 thesis end-to-end (the v1 finish line, DEC-013). They build against the
+# shared `abi` crate only — a userspace process has no business depending on kernel internals;
+# it talks to the kernel exclusively through the ABI (capability invocations). Compiled to the
+# .pex format by `tools`, staged by `xtask`.
+
+[package]
+name         = "refproc"
+version      = "0.0.1"
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+description  = "Praesidium v1 reference userspace processes — prove capability IPC + isolation (P7)."
+
+# Two minimal processes: a 'ping' and a 'pong' that round-trip a message over a capability
+# endpoint and demonstrate they cannot read each other's memory. Each is its own tiny binary.
+[[bin]]
+name = "ping"
+path = "src/ping.rs"
+
+[[bin]]
+name = "pong"
+path = "src/pong.rs"
+
+[dependencies]
+abi = { path = "../abi" }          # userspace touches the kernel ONLY through the ABI
+log.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

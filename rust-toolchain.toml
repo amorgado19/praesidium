@@ -1,0 +1,24 @@
+# Praesidium toolchain pin.
+#
+# Why nightly (not stable, unlike Warden's UEFI targets): a from-scratch bare-metal kernel
+# with an in-kernel async executor (ADR-0003) needs `build-std` to compile core/alloc for the
+# *-unknown-none targets, plus nightly-only features for the custom executor and low-level
+# intrinsics. These features do not exist on stable yet — this is a hard requirement, not a
+# preference. Pin a dated nightly so builds are reproducible; bump deliberately, never drift.
+#
+# rustup reads this file automatically the moment `cargo`/`rustc` runs in this directory and
+# provisions the toolchain + targets + components — no manual `rustup override` needed.
+
+[toolchain]
+channel = "nightly-2026-07-01"
+components = [
+    "rust-src",            # required for build-std (compiling core/alloc for *-unknown-none)
+    "llvm-tools-preview",  # cargo-binutils: objdump/nm on the kernel image + .pex artifacts
+    "rustfmt",
+    "clippy",
+]
+targets = [
+    "x86_64-unknown-none",   # bare-metal kernel image, x86-64 (ADR-0007 backend)
+    "aarch64-unknown-none",  # bare-metal kernel image, aarch64 (ADR-0007 backend)
+]
+profile = "minimal"

@@ -1,0 +1,33 @@
+# xtask — host-side build / run / test harness (mirrors Warden's proven pattern).
+#
+# The single entry point for building the dual-arch kernel, staging it as a Warden module,
+# booting Warden+Praesidium under QEMU (OVMF x86-64 / AAVMF aarch64) + swtpm, and running the
+# per-phase smoke scenarios that assert serial markers. This is a HOST binary (std allowed) —
+# it orchestrates the build, it is not part of the kernel image.
+#
+# Usage mirrors Warden:
+#   cargo run -p xtask -- build  --arch x86_64|aarch64
+#   cargo run -p xtask -- smoke  --arch x86_64|aarch64 --scenario <name>
+#   cargo run -p xtask -- build-pex <refproc-bin>
+# (a `cargo xtask ...` alias is set in .cargo/config.toml)
+
+[package]
+name         = "xtask"
+version      = "0.0.1"
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+description  = "Host-side build/run/test harness for Praesidium: dual-arch build + Warden+QEMU boot smoke (mirrors Warden's xtask)."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+# host tool — std + process orchestration. Kept dependency-light; add an arg parser (clap) and
+# anything QEMU-orchestration-related here as the harness fills in during P0.
+abi = { path = "../abi" }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

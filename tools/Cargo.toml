@@ -1,0 +1,28 @@
+# tools — host-side .pex toolchain (ADR-0006 NEG-004: own format = own toolchain).
+#
+# Produces .pex executables from compiled userspace binaries: reads the compiled ELF/object,
+# emits Praesidium's own capability-native executable format including the capability manifest
+# (the declared initial caps a process needs) and the reserved integrity/signature section.
+# This is a HOST binary (runs on your Arch box during the build), NOT part of the kernel image
+# — so it uses std freely, unlike everything that ends up in the kernel.
+
+[package]
+name         = "tools"
+version      = "0.0.1"
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+description  = "Host-side Praesidium toolchain: produce .pex executables + capability manifests (ADR-0006)."
+
+[[bin]]
+name = "mkpex"          # `mkpex <input> -o <output.pex> --manifest <caps.toml>`
+path = "src/mkpex.rs"
+
+[dependencies]
+abi = { path = "../abi" }          # shares the .pex format definitions with the kernel loader
+# host tool — std allowed; add ELF-reading + serialization deps here as the format solidifies
+# (e.g. object, goblin) — left minimal until the .pex format is nailed down in P6.
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

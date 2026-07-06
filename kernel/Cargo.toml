@@ -1,0 +1,44 @@
+# kernel — the Praesidium kernel binary (bare-metal ELF, loaded by Warden's rich handoff).
+#
+# Built for x86_64-unknown-none / aarch64-unknown-none, always --release (panic=abort). All
+# arch divergence lives behind the arch:: seam (ADR-0007); arch-specific crates are pulled in
+# only under the matching [target.'cfg(...)'] section so nothing arch-specific leaks into the
+# generic build.
+
+[package]
+name         = "kernel"
+version      = "0.0.1"
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+description  = "The Praesidium kernel: capability-native, SASOS, dual-arch Rust microkernel-hybrid."
+
+[[bin]]
+name = "praesidium"
+path = "src/main.rs"
+
+[dependencies]
+cap-core = { path = "../cap-core" }
+abi      = { path = "../abi" }
+log.workspace       = true
+bitflags.workspace  = true
+static_assertions.workspace = true
+
+# ----------------------------------------------------------------------------------------
+# Arch-specific dependencies (ADR-0007 seam). These are the ONLY places arch crates appear;
+# if an arch crate is needed outside its cfg block, that's a leak past the seam (DEC-0007-1).
+# ----------------------------------------------------------------------------------------
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "0.15"          # paging, control regs, IDT/APIC helpers (x86-64 backend only)
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+aarch64-cpu = "10"       # system registers, barriers, exception-level helpers (aarch64 backend only)
+
+[lints.rust]
+# The kernel above cap-core should be nearly unsafe-free; flag it loudly where it appears.
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"   # GC-06: every unsafe block carries a // SAFETY: note

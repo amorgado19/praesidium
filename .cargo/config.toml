@@ -1,0 +1,35 @@
+# Praesidium cargo configuration.
+#
+# Two jobs: (1) the `cargo xtask` alias so the harness reads like Warden's, and (2) build-std
+# setup so the bare-metal *-unknown-none targets compile core/alloc from source (there's no
+# precompiled std for these targets — this is why rust-toolchain.toml pins `rust-src`).
+
+[alias]
+# `cargo xtask ...` -> `cargo run -p xtask -- ...` (matches Warden's workflow)
+xtask = "run -p xtask --"
+
+# ----------------------------------------------------------------------------------------
+# Bare-metal target configuration. build-std compiles core + alloc for the kernel targets.
+# compiler-builtins mem feature provides memcpy/memset/etc. that a no_std kernel needs.
+# ----------------------------------------------------------------------------------------
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+# kernel linker script wiring is passed by xtask per-arch; rustflags here stay minimal.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tkernel/linker-x86_64.ld",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tkernel/linker-aarch64.ld",
+]
+
+# Host builds (xtask, tools, and `cargo test` for cap-core/abi/allocator unit tests) use the
+# host target normally — no build-std, full std. cargo picks the host target automatically for
+# those; the [unstable] build-std above only applies when a *-unknown-none target is selected.
