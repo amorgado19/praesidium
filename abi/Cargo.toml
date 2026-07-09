@@ -18,5 +18,8 @@ description  = "Praesidium syscall ABI + .pex executable format — the frozen k
 bitflags.workspace = true
 static_assertions.workspace = true   # #[repr(C)] layout tripwires on ABI structs (Warden-style)
 
+[lints.rust]
+warnings = "deny"                     # AC0.3: -D warnings clean
+
 [lints.clippy]
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"

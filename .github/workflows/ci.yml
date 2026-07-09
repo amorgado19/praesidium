@@ -1,0 +1,113 @@
+# Praesidium CI (P0). Enforces the AC0.3 gate: dual-arch `-D warnings` build +
+# clippy + rustfmt, and a real Warden+QEMU boot smoke on BOTH arches (OVMF x86-64
+# / AAVMF aarch64), mirroring Warden's CI discipline (ADR-0007 DEC-0007-5).
+#
+# The toolchain (channel + components + targets) is pinned by rust-toolchain.toml,
+# which rustup provisions automatically on first `cargo` invocation.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --- Self-contained gate: build both arches -D warnings, clippy, fmt ----------
+  build:
+    name: build+lint (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Provision pinned toolchain (rust-toolchain.toml)
+        run: rustup show    # triggers install of channel + components + targets
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        if: matrix.arch == 'x86_64'
+        run: cargo fmt --all --check
+      - name: build kernel (-D warnings via crate [lints])
+        run: cargo xtask build --arch ${{ matrix.arch }}
+      - name: clippy kernel
+        run: cargo clippy -p kernel --release --target ${{ matrix.arch }}-unknown-none
+      # Host unit tests (cap model, allocator, .pex parser) arrive in P2+. They are
+      # NOT run in P0: the global build-std (.cargo/config.toml) recompiles `core`,
+      # which collides with libtest's `core` on the host (E0152). Enabling host
+      # tests requires scoping build-std off the host target — done when the first
+      # host test lands (P2), so the fix ships with the code it protects.
+
+  # --- Real boot smoke: Warden + QEMU + swtpm, both arches ----------------------
+  # Consumes a PREBUILT Warden bootloader (the "consume prebuilt via env path"
+  # model). Wire ONE of:
+  #   * repo/org variable WARDEN_REPO (+ secret WARDEN_TOKEN if private) — this job
+  #     checks it out and builds warden.efi for the matching UEFI arch, then points
+  #     WARDEN_EFI_* at the artifact; or
+  #   * a pre-provisioned self-hosted runner that already has warden.efi on disk
+  #     (set WARDEN_EFI_X64 / WARDEN_EFI_A64 as env).
+  # Without either, this job fails loudly (AC0.3 requires a real boot, not a skip).
+  smoke:
+    name: boot smoke (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            uefi: x86_64-unknown-uefi
+            efi_env: WARDEN_EFI_X64
+            timeout: 240
+          - arch: aarch64
+            uefi: aarch64-unknown-uefi
+            efi_env: WARDEN_EFI_A64
+            timeout: 420
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: praesidium
+      - name: Provision pinned toolchain
+        working-directory: praesidium
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: praesidium
+
+      - name: Install QEMU + firmware + swtpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 swtpm
+
+      # Obtain the prebuilt Warden bootloader for this arch.
+      - name: Check out Warden
+        if: ${{ vars.WARDEN_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.WARDEN_REPO }}
+          ref: ${{ vars.WARDEN_REF || 'main' }}
+          token: ${{ secrets.WARDEN_TOKEN || github.token }}
+          path: warden
+      - name: Build Warden (${{ matrix.uefi }})
+        if: ${{ vars.WARDEN_REPO != '' }}
+        working-directory: warden
+        run: |
+          rustup target add ${{ matrix.uefi }} || true
+          cargo build -p warden --release --target ${{ matrix.uefi }}
+          echo "${{ matrix.efi_env }}=$GITHUB_WORKSPACE/warden/target/${{ matrix.uefi }}/release/warden.efi" >> "$GITHUB_ENV"
+      - name: Fail if no Warden binary is configured
+        if: ${{ vars.WARDEN_REPO == '' && env[matrix.efi_env] == '' }}
+        run: |
+          echo "::error::No Warden bootloader available. Set the WARDEN_REPO variable" \
+               "(and WARDEN_TOKEN if private) or provide ${{ matrix.efi_env }} on a" \
+               "self-hosted runner. AC0.3 requires a real boot."
+          exit 1
+
+      - name: Boot smoke (${{ matrix.arch }})
+        working-directory: praesidium
+        run: cargo xtask smoke --arch ${{ matrix.arch }} --timeout ${{ matrix.timeout }}

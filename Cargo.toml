@@ -7,10 +7,13 @@ members = [
     "cap-core",   # SPEC-CAP CAP-RUST-1: the ONLY unsafe capability-fabrication crate
     "abi",        # syscall ABI + .pex executable format (shared kernel <-> userspace)
     "kernel",     # the kernel binary (bare-metal ELF, loaded by Warden's rich handoff)
-    "refproc",    # v1 reference userspace processes (the two that IPC in P7)
-    "tools",      # host-side .pex toolchain (producer / linker-objcopy-equivalent)
     "xtask",      # host-side build/run/test harness (mirrors Warden's), dual-arch + QEMU
 ]
+# `refproc` (P7 userspace processes) and `tools` (P6 .pex toolchain) declare [[bin]]
+# targets whose sources don't exist yet, so they are NOT workspace members during P0 —
+# an empty-source member would break `cargo fmt --all` / `--workspace` / CI. They rejoin
+# `members` in the phase that writes their sources (tools → P6, refproc → P7). Their
+# directories + manifests stay on disk in the meantime.
 
 # `cargo build` at the root builds only the no_std / bare-metal members that make up the
 # kernel image. xtask and tools are HOST tools built explicitly (`cargo run -p xtask ...`),

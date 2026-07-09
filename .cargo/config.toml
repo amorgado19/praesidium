@@ -18,9 +18,13 @@ build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-unknown-none]
-# kernel linker script wiring is passed by xtask per-arch; rustflags here stay minimal.
+# The kernel links at the canonical -2 GiB higher-half base (0xffffffff80000000).
+# `code-model=kernel` makes RIP-relative references resolve within the negative
+# 2 GiB half (the Warden refkernel lesson); `relocation-model=static` keeps the
+# image position-fixed. The linker script wires the load address + entry.
 rustflags = [
     "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
     "-C", "link-arg=-Tkernel/linker-x86_64.ld",
 ]
 
@@ -30,6 +34,9 @@ rustflags = [
     "-C", "link-arg=-Tkernel/linker-aarch64.ld",
 ]
 
-# Host builds (xtask, tools, and `cargo test` for cap-core/abi/allocator unit tests) use the
-# host target normally — no build-std, full std. cargo picks the host target automatically for
-# those; the [unstable] build-std above only applies when a *-unknown-none target is selected.
+# NOTE (P0): the [unstable] build-std above is global — it recompiles core/alloc for EVERY
+# target, including the host. Host *library* builds and `cargo run -p xtask` are fine, but a
+# host *test* target (`cargo test -p cap-core`) pulls libtest's prebuilt `core` alongside the
+# build-std `core` and fails with E0152 (duplicate lang items). P0 has no host tests, so this
+# is deferred: when the first host unit test lands (P2), build-std will be scoped off the host
+# target (e.g. moved to per-invocation `-Z build-std` in xtask) so `cargo test` works again.

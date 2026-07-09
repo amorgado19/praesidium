@@ -21,8 +21,9 @@ static_assertions.workspace = true # layout tripwires on the capability represen
 [lints.rust]
 # cap-core is the trust root: unsafe is allowed here (it's the whole point) but must be
 # documented. Everywhere else in the workspace, unsafe should be near-absent.
-unsafe_op_in_unsafe_fn = "warn"
+warnings = "deny"                     # AC0.3: -D warnings clean
+unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 # tighten the screws on the most safety-critical crate
-undocumented_unsafe_blocks = "warn"   # every unsafe block needs a // SAFETY: note (GC-06)
+undocumented_unsafe_blocks = "deny"   # every unsafe block needs a // SAFETY: note (GC-06)

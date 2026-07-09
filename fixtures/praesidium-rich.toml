@@ -1,0 +1,17 @@
+# P0 warden-rich boot fixture (AC0.1 / AC0.2).
+#
+# Warden loads the Praesidium kernel ELF higher-half via its custom warden-rich
+# protocol: it builds the page tables, exits boot services itself, and jumps to
+# `_start` with a WardenBootInfo pointer. xtask stages this file onto the ESP as
+# `\warden.toml`. Schema mirrors Warden's fixtures/warden-rich.toml.
+
+[global]
+timeout = 1
+default = "praesidium"
+console = "serial"
+
+[[entry]]
+id       = "praesidium"
+title    = "Praesidium (warden-rich handoff, P0)"
+protocol = "warden-rich"
+kernel   = "esp:/praesidium"

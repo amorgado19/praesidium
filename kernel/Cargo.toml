@@ -38,7 +38,8 @@ aarch64-cpu = "10"       # system registers, barriers, exception-level helpers (
 
 [lints.rust]
 # The kernel above cap-core should be nearly unsafe-free; flag it loudly where it appears.
-unsafe_op_in_unsafe_fn = "warn"
+warnings = "deny"                     # AC0.3: dual-arch -D warnings clean (per-crate; build-std unaffected)
+unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
-undocumented_unsafe_blocks = "warn"   # GC-06: every unsafe block carries a // SAFETY: note
+undocumented_unsafe_blocks = "deny"   # GC-06: every unsafe block carries a // SAFETY: note
