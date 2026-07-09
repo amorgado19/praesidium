@@ -13,6 +13,7 @@
 mod serial;
 mod arch;
 mod boot;
+mod cap;
 mod memory;
 mod sync;
 
@@ -44,6 +45,9 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
 
     // P1: bring up the physical memory subsystem (prints PRAESIDIUM-P1-OK on success).
     memory::init(bi);
+
+    // P2: bring up the capability core (prints PRAESIDIUM-P2-OK on success).
+    cap::run();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

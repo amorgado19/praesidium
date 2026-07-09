@@ -1,12 +1,24 @@
 //! # cap-core — the capability trust root (SPEC-CAP CAP-RUST-1)
 //!
-//! This is the *only* crate permitted to fabricate capability values via `unsafe`.
-//! It is intentionally tiny so its entire unsafe surface can be audited
-//! exhaustively; if it ever grows a large dependency tree or public API, that is a
-//! red flag — the whole security model rests on this staying small and reviewable.
+//! The runtime + compile-time layers of the Praesidium capability model: the capability
+//! record ([`RawCap`]), the typed wrapper ([`Cap<T>`]) with the **single** `unsafe`
+//! fabrication point, capability rights ([`Rights`]), and the capability space
+//! ([`CSpace`]) with its derivation tree (MDB) and the RETYPE / MINT / COPY / MOVE /
+//! REVOKE / DELETE operations.
 //!
-//! **In P0 it is deliberately empty.** The kernel introduces no authority yet (it
-//! validates the Warden handoff and halts), so no capability type or `unsafe`
-//! fabrication exists. The capability primitives (`Cap<T, Rights>`, RETYPE/MINT/
-//! COPY/MOVE, the MDB, REVOKE) land in **P2**.
-#![no_std]
+//! This crate is the trust root: **any `unsafe` bug here is a total capability-model
+//! bypass**, so it is kept small and exhaustively auditable (CAP-RUST-1) — the *only*
+//! `unsafe` capability fabrication in the whole kernel is [`Cap::fabricate`]. Everything
+//! else is safe code that funnels through it. It is pure logic over abstract storage, so
+//! `cargo test -p cap-core` exercises the derivation tree, revoke transitivity, and rights
+//! monotonicity on the host; the kernel (`kernel/src/cap/`) wires RETYPE to P1's physical
+//! allocator + HHDM zeroing.
+#![cfg_attr(not(test), no_std)]
+
+pub mod cap;
+pub mod cspace;
+pub mod rights;
+
+pub use cap::{Cap, CapType, ObjectType, RawCap};
+pub use cspace::{CSpace, CapError, Cptr};
+pub use rights::Rights;

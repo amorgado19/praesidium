@@ -36,9 +36,9 @@ jobs:
         run: cargo xtask build --arch ${{ matrix.arch }}
       - name: clippy kernel
         run: cargo clippy -p kernel --release --target ${{ matrix.arch }}-unknown-none -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-      - name: host unit tests (mem allocator)
+      - name: host unit tests (mem allocator + capability core)
         if: matrix.arch == 'x86_64'
-        run: cargo test -p mem
+        run: cargo test -p mem -p cap-core
       - name: clippy host crates
         if: matrix.arch == 'x86_64'
         run: cargo clippy -p mem -p cap-core -p abi -p xtask

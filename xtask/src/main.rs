@@ -157,6 +157,17 @@ const P1_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P1-OK",
 ];
 
+/// P2 (cap): P1 plus the capability core exercising RETYPE/MINT/COPY/REVOKE.
+const P2_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P1-OK",
+    "[praesidium] cap: root Untyped",
+    "RETYPE 4 Frames",                  // AC2.1
+    "widening refused",                 // AC2.2
+    "REVOKE destroyed all descendants", // AC2.3
+    "revoked cptr -> EmptySlot",        // CAP-REVOKE-1: fails cleanly
+    "PRAESIDIUM-P2-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -169,6 +180,12 @@ const SCENARIOS: &[Scenario] = &[
         required: P1_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P1-OK",
+    },
+    Scenario {
+        name: "cap",
+        required: P2_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P2-OK",
     },
 ];
 
@@ -217,9 +234,9 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
-    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "mem".into());
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "cap".into());
     let sc = scenario(&scenario_name)
-        .ok_or_else(|| format!("unknown --scenario {scenario_name} (have: p0-rich, mem)"))?;
+        .ok_or_else(|| format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap)"))?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))
         .transpose()?
