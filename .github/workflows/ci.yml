@@ -35,12 +35,13 @@ jobs:
       - name: build kernel (-D warnings via crate [lints])
         run: cargo xtask build --arch ${{ matrix.arch }}
       - name: clippy kernel
-        run: cargo clippy -p kernel --release --target ${{ matrix.arch }}-unknown-none
-      # Host unit tests (cap model, allocator, .pex parser) arrive in P2+. They are
-      # NOT run in P0: the global build-std (.cargo/config.toml) recompiles `core`,
-      # which collides with libtest's `core` on the host (E0152). Enabling host
-      # tests requires scoping build-std off the host target — done when the first
-      # host test lands (P2), so the fix ships with the code it protects.
+        run: cargo clippy -p kernel --release --target ${{ matrix.arch }}-unknown-none -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+      - name: host unit tests (mem allocator)
+        if: matrix.arch == 'x86_64'
+        run: cargo test -p mem
+      - name: clippy host crates
+        if: matrix.arch == 'x86_64'
+        run: cargo clippy -p mem -p cap-core -p abi -p xtask
 
   # --- Real boot smoke: Warden + QEMU + swtpm, both arches ----------------------
   # Consumes a PREBUILT Warden bootloader (the "consume prebuilt via env path"

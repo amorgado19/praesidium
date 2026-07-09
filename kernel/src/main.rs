@@ -13,22 +13,37 @@
 mod serial;
 mod arch;
 mod boot;
+mod memory;
+mod sync;
 
 use boot::handoff::WardenBootInfo;
 
-/// Kernel entry. Warden's warden-rich loader jumps here after building the page
-/// tables and exiting boot services, passing an **HHDM-virtual** pointer to
-/// [`WardenBootInfo`] in the C first-argument register (`rdi` on x86-64, `x0` on
-/// aarch64 — the `extern "C"` ABI covers both).
-#[no_mangle]
-extern "C" fn _start(bootinfo: *const WardenBootInfo) -> ! {
+/// The kernel's own boot stack, in `.bss` — part of the kernel image, so the frame
+/// allocator never hands out its frames. Warden's boot stack lives in memory the
+/// allocator *does* manage (UEFI `BOOT_SERVICES_DATA` → `USABLE`), so building page
+/// tables on it would clobber the running stack; the per-arch naked `_start` switches
+/// to this stack before any Rust that allocates runs.
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024;
+
+#[repr(C, align(16))]
+pub(crate) struct BootStack([u8; BOOT_STACK_SIZE]);
+
+pub(crate) static mut BOOT_STACK: BootStack = BootStack([0; BOOT_STACK_SIZE]);
+
+/// Kernel entry proper. The per-arch naked [`_start`](arch) sets up [`BOOT_STACK`] and
+/// tail-calls this with the C first-argument register still holding the Warden handoff
+/// pointer (`rdi` on x86-64, `x0` on aarch64 — the `extern "C"` ABI covers both). The
+/// pointer is **HHDM-virtual**.
+pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     arch::serial_init();
     kprintln!();
     kprintln!("[praesidium] warden-rich kernel entered");
 
-    boot::init_and_dump(bootinfo);
-
+    let bi = boot::validate_and_dump(bootinfo);
     kprintln!("[praesidium] PRAESIDIUM-P0-OK");
+
+    // P1: bring up the physical memory subsystem (prints PRAESIDIUM-P1-OK on success).
+    memory::init(bi);
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

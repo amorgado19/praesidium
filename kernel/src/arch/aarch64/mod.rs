@@ -8,6 +8,29 @@
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
+mod paging;
+pub use paging::{activate_address_space, build_address_space, enable_wx, page_prot, translate};
+
+/// ELF entry from Warden (`x0` = the `WardenBootInfo` pointer). Switch to the kernel's
+/// own boot stack (Warden's stack is in allocator-managed RAM), then tail-call
+/// [`crate::kmain`] with `x0` untouched.
+#[no_mangle]
+#[unsafe(naked)]
+extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "adrp x9, {stack}",
+        "add x9, x9, :lo12:{stack}",
+        "mov x10, {size}",
+        "add x9, x9, x10",
+        "mov sp, x9",
+        "bl {main}",
+        "brk #0",
+        stack = sym crate::BOOT_STACK,
+        size = const crate::BOOT_STACK_SIZE,
+        main = sym crate::kmain,
+    );
+}
+
 /// PL011 data register on the QEMU `virt` machine. Warden maps this MMIO window
 /// as Device memory in both the TTBR0 identity map and the TTBR1 HHDM, so the
 /// fixed physical address is reachable at kernel entry.

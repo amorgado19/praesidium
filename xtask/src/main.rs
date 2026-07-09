@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario mem|p0-rich] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -115,26 +115,66 @@ const AARCH64: ArchSpec = ArchSpec {
     firmware_env: ("AAVMF_CODE", "AAVMF_VARS"),
 };
 
-/// The headline success marker (also the early-exit trigger).
-const SUCCESS_MARKER: &str = "PRAESIDIUM-P0-OK";
+/// A boot-smoke scenario: the serial markers to assert, keyed by `--scenario`.
+struct Scenario {
+    name: &'static str,
+    /// All must appear.
+    required: &'static [&'static str],
+    /// None may appear.
+    forbidden: &'static [&'static str],
+    /// Headline success marker (the last required) — also the early-exit trigger.
+    success: &'static str,
+}
 
-/// Required serial markers for the P0 warden-rich smoke (all must appear).
-const P0_REQUIRED: &[&str] = &[
-    "jumping to warden-rich kernel", // Warden loaded + launched us
-    "[praesidium] warden-rich kernel entered", // our entry ran
-    "[praesidium] CONTRACT OK",      // magic + abi_version validated
-    "[praesidium] memmap regions=",  // memmap dumped
-    SUCCESS_MARKER,                  // headline success
-];
-
-/// Forbidden markers (any appearance fails the smoke).
-const P0_FORBIDDEN: &[&str] = &[
+/// Forbidden markers shared by every scenario.
+const FORBIDDEN: &[&str] = &[
     "PRAESIDIUM PANIC",
     "[praesidium] PANIC",
     "[praesidium] FATAL",
     "WARDEN PANIC",
     "could not obtain UEFI memory map",
 ];
+
+/// P0: Warden handoff + serial + clean halt.
+const P0_REQUIRED: &[&str] = &[
+    "jumping to warden-rich kernel", // Warden loaded + launched us
+    "[praesidium] warden-rich kernel entered", // our entry ran
+    "[praesidium] CONTRACT OK",      // magic + abi_version validated
+    "[praesidium] memmap regions=",  // memmap dumped
+    "PRAESIDIUM-P0-OK",              // headline success
+];
+
+/// P1 (mem): P0 plus the memory subsystem on its own page tables with W^X.
+const P1_REQUIRED: &[&str] = &[
+    "[praesidium] CONTRACT OK",
+    "PRAESIDIUM-P0-OK",
+    "[praesidium] mem: buddy managing", // buddy over the Warden memmap
+    "[praesidium] mem: own page tables active", // AC1.4
+    "[praesidium] mem: W^X verified",   // AC1.3
+    "distinct + zeroed + writable",     // AC1.1
+    "[praesidium] mem: slab",           // AC1.2
+    "zero-on-retype verified",          // CAP-MEM-2
+    "PRAESIDIUM-P1-OK",
+];
+
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "p0-rich",
+        required: P0_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P0-OK",
+    },
+    Scenario {
+        name: "mem",
+        required: P1_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P1-OK",
+    },
+];
+
+fn scenario(name: &str) -> Option<&'static Scenario> {
+    SCENARIOS.iter().find(|s| s.name == name)
+}
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -160,7 +200,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario mem|p0-rich] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -177,6 +217,9 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "mem".into());
+    let sc = scenario(&scenario_name)
+        .ok_or_else(|| format!("unknown --scenario {scenario_name} (have: p0-rich, mem)"))?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))
         .transpose()?
@@ -207,6 +250,7 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
         &vars,
         tpm_sock.as_deref(),
         timeout,
+        sc,
     );
 
     if let Some((mut child, _)) = tpm {
@@ -215,11 +259,14 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     }
     let (log, exited_early) = run?;
 
-    println!("----- captured serial ({}) -----", arch.name);
+    println!(
+        "----- captured serial ({}, scenario {}) -----",
+        arch.name, sc.name
+    );
     print!("{log}");
     println!("\n----- end serial ({}) -----", arch.name);
 
-    let markers_ok = assert_markers(&log, P0_REQUIRED, P0_FORBIDDEN);
+    let markers_ok = assert_markers(&log, sc.required, sc.forbidden);
     // Positive clean-halt check: a passing P0 kernel parks in hlt/wfi, so QEMU must
     // still have been running when the watchdog killed it. An early self-exit
     // (reset / triple-fault under -no-reboot) is a failure even if markers appear.
@@ -247,6 +294,10 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
         .current_dir(&root)
         .args([
             "build",
+            // build-std is passed here (not in .cargo/config.toml) so it applies only to the
+            // bare-metal kernel image and never to host builds — keeping `cargo test` working.
+            "-Zbuild-std=core,alloc,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
             "-p",
             "kernel",
             "--release",
@@ -440,6 +491,7 @@ fn run_qemu(
     vars: &Path,
     tpm_sock: Option<&Path>,
     timeout: u64,
+    sc: &Scenario,
 ) -> Result<(String, bool), String> {
     let mut args: Vec<String> = Vec::new();
     for m in arch.machine {
@@ -509,8 +561,8 @@ fn run_qemu(
         }
     });
 
-    let forbidden: Vec<&[u8]> = P0_FORBIDDEN.iter().map(|s| s.as_bytes()).collect();
-    let success = SUCCESS_MARKER.as_bytes();
+    let forbidden: Vec<&[u8]> = sc.forbidden.iter().map(|s| s.as_bytes()).collect();
+    let success = sc.success.as_bytes();
     // Once the success marker lands, keep draining for a short grace window so a
     // forbidden marker emitted right *after* it is still caught (defeats a
     // "print OK then fault" mask). Forbidden is checked first each iteration, so if

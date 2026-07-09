@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 cap-core = { path = "../cap-core" }
 abi      = { path = "../abi" }
+mem      = { path = "../mem" }
 log.workspace       = true
 bitflags.workspace  = true
 static_assertions.workspace = true

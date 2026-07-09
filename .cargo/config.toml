@@ -9,13 +9,16 @@
 xtask = "run -p xtask --"
 
 # ----------------------------------------------------------------------------------------
-# Bare-metal target configuration. build-std compiles core + alloc for the kernel targets.
-# compiler-builtins mem feature provides memcpy/memset/etc. that a no_std kernel needs.
+# Bare-metal target configuration (linker script + code model per arch).
+#
+# build-std is deliberately NOT set here. It is passed per-invocation by xtask's kernel
+# build (`-Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem`)
+# so it applies ONLY to the *-unknown-none kernel image, never to host builds. A GLOBAL
+# `[unstable] build-std` would recompile `core` for the host too and collide with libtest's
+# prebuilt `core` (E0152), breaking `cargo test -p mem` / `-p cap-core`. Consequence: a direct
+# `cargo build/clippy --target *-unknown-none` needs those -Z flags too — use `cargo xtask
+# build --arch ...`, or pass `-Zbuild-std=...` explicitly (as CI's kernel clippy step does).
 # ----------------------------------------------------------------------------------------
-
-[unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-unknown-none]
 # The kernel links at the canonical -2 GiB higher-half base (0xffffffff80000000).
@@ -34,9 +37,6 @@ rustflags = [
     "-C", "link-arg=-Tkernel/linker-aarch64.ld",
 ]
 
-# NOTE (P0): the [unstable] build-std above is global — it recompiles core/alloc for EVERY
-# target, including the host. Host *library* builds and `cargo run -p xtask` are fine, but a
-# host *test* target (`cargo test -p cap-core`) pulls libtest's prebuilt `core` alongside the
-# build-std `core` and fails with E0152 (duplicate lang items). P0 has no host tests, so this
-# is deferred: when the first host unit test lands (P2), build-std will be scoped off the host
-# target (e.g. moved to per-invocation `-Z build-std` in xtask) so `cargo test` works again.
+# Host builds (xtask, tools, and `cargo test -p mem` / `-p cap-core` unit tests) use the host
+# target with normal prebuilt std — no build-std, so libtest links cleanly. cargo selects the
+# host target automatically for those.

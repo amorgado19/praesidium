@@ -6,6 +6,29 @@
 
 use core::arch::asm;
 
+mod paging;
+pub use paging::{activate_address_space, build_address_space, enable_wx, page_prot, translate};
+
+/// ELF entry from Warden (`rdi` = the `WardenBootInfo` pointer). We switch to the
+/// kernel's own boot stack — Warden's stack is in allocator-managed RAM, so we must
+/// leave it before the frame allocator runs — then tail-call [`crate::kmain`] with
+/// `rdi` untouched. `BOOT_STACK` is 16-aligned and `call` pushes 8, so `kmain` sees
+/// the ABI-required `rsp ≡ 8 (mod 16)`.
+#[no_mangle]
+#[unsafe(naked)]
+extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "lea rsp, [rip + {stack}]",
+        "add rsp, {size}",
+        "xor ebp, ebp",
+        "call {main}",
+        "ud2",
+        stack = sym crate::BOOT_STACK,
+        size = const crate::BOOT_STACK_SIZE,
+        main = sym crate::kmain,
+    );
+}
+
 /// COM1 base I/O port — the UART QEMU exposes on `-serial stdio` for x86-64.
 const COM1: u16 = 0x3F8;
 /// Line Status Register (COM1 + 5).

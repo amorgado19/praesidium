@@ -18,7 +18,7 @@ const MAX_DUMP_ROWS: u64 = 32;
 
 /// Validate the warden-rich handoff and dump what Warden gave us. On a contract
 /// violation this logs `FATAL` and halts — it never proceeds on bad input.
-pub fn init_and_dump(bootinfo: *const WardenBootInfo) {
+pub fn validate_and_dump(bootinfo: *const WardenBootInfo) -> &'static WardenBootInfo {
     if bootinfo.is_null() {
         kprintln!("[praesidium] FATAL: null bootinfo pointer");
         crate::arch::halt();
@@ -35,7 +35,7 @@ pub fn init_and_dump(bootinfo: *const WardenBootInfo) {
     // warden-rich contract (REF-001), points at a WardenBootInfo mapped at this
     // HHDM-virtual address. We only read it, and treat every field *value* as
     // hostile below.
-    let bi = unsafe { &*bootinfo };
+    let bi: &'static WardenBootInfo = unsafe { &*bootinfo };
 
     kprintln!(
         "[praesidium] magic={:#018x} abi_version={}",
@@ -59,6 +59,7 @@ pub fn init_and_dump(bootinfo: *const WardenBootInfo) {
 
     dump_framebuffer(bi);
     dump_memmap(bi);
+    bi
 }
 
 fn dump_framebuffer(bi: &WardenBootInfo) {

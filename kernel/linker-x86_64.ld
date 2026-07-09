@@ -14,10 +14,23 @@ SECTIONS {
     . = 0xffffffff80000000;
     __kernel_start = .;
 
-    .text   : ALIGN(0x1000) { *(.text .text.*) }
-    .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) }
-    .data   : ALIGN(0x1000) { *(.data .data.*) }
-    .bss    : ALIGN(0x1000) { *(.bss .bss.*) *(COMMON) }
+    /* Page-aligned section boundaries so P1 can map each section with its own
+     * protection (W^X): .text R-X, .rodata R--, .data/.bss RW-. */
+    __text_start = .;
+    .text : { *(.text .text.*) }
+    . = ALIGN(0x1000);
+    __text_end = .;
+
+    __rodata_start = .;
+    .rodata : { *(.rodata .rodata.*) }
+    . = ALIGN(0x1000);
+    __rodata_end = .;
+
+    __data_start = .;
+    .data : { *(.data .data.*) }
+    .bss  : { *(.bss .bss.*) *(COMMON) }
+    . = ALIGN(0x1000);
+    __data_end = .;
 
     __kernel_end = .;
 

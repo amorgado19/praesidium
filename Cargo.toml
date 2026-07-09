@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     "cap-core",   # SPEC-CAP CAP-RUST-1: the ONLY unsafe capability-fabrication crate
     "abi",        # syscall ABI + .pex executable format (shared kernel <-> userspace)
+    "mem",        # ADR-0002 P1: host-testable buddy/slab/retype allocator logic
     "kernel",     # the kernel binary (bare-metal ELF, loaded by Warden's rich handoff)
     "xtask",      # host-side build/run/test harness (mirrors Warden's), dual-arch + QEMU
 ]
@@ -18,7 +19,7 @@ members = [
 # `cargo build` at the root builds only the no_std / bare-metal members that make up the
 # kernel image. xtask and tools are HOST tools built explicitly (`cargo run -p xtask ...`),
 # and refproc builds for the userspace side of the ABI, staged separately by xtask.
-default-members = ["cap-core", "abi", "kernel"]
+default-members = ["cap-core", "abi", "mem", "kernel"]
 
 [workspace.package]
 edition       = "2021"

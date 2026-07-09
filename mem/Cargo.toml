@@ -1,0 +1,24 @@
+# mem — pure, host-testable physical-memory allocator logic (ADR-0002, P1).
+#
+# Buddy allocator, slab cache, and Untyped retype accounting as arch-independent
+# `no_std` logic operating over caller-provided storage (a frame-descriptor array,
+# byte regions). The kernel drives it over HHDM-mapped physical memory; the host
+# test suite (`cargo test -p mem`) exercises it over plain Vecs. No arch, asm, or
+# entry code lives here on purpose — that keeps the allocator math trivially
+# host-testable and decoupled from the bare-metal target.
+[package]
+name         = "mem"
+version      = "0.0.1"
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+description  = "Praesidium physical-memory allocator logic: buddy + slab + Untyped retype (host-testable no_std, ADR-0002)."
+
+[dependencies]
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
