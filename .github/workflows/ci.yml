@@ -36,12 +36,12 @@ jobs:
         run: cargo xtask build --arch ${{ matrix.arch }}
       - name: clippy kernel
         run: cargo clippy -p kernel --release --target ${{ matrix.arch }}-unknown-none -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-      - name: host unit tests (mem allocator + capability core)
+      - name: host unit tests (mem allocator + capability core + executor)
         if: matrix.arch == 'x86_64'
-        run: cargo test -p mem -p cap-core
+        run: cargo test -p mem -p cap-core -p sched
       - name: clippy host crates
         if: matrix.arch == 'x86_64'
-        run: cargo clippy -p mem -p cap-core -p abi -p xtask
+        run: cargo clippy -p mem -p cap-core -p sched -p abi -p xtask
 
   # --- Real boot smoke: Warden + QEMU + swtpm, both arches ----------------------
   # Consumes a PREBUILT Warden bootloader (the "consume prebuilt via env path"

@@ -1,0 +1,26 @@
+# sched — the Praesidium async executor + capability-scheduling logic (ADR-0003, P3).
+#
+# Arch-independent, no_std (over `alloc`): the cooperative Future executor (Tier 1) and the
+# Sched-budget runnability logic. Deliberately arch-free and entry-point-free — the kernel
+# integration layer (kernel/src/sched/) provides the heap, binds Sched caps to tasks, and
+# (in P3b) adds the preemptive fallback + context switch. Pure enough that `cargo test -p sched`
+# exercises the poll loop, cooperative yielding, and budget gating on the host.
+
+[package]
+name         = "sched"
+version      = "0.0.1"
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Praesidium async executor + Sched-budget runnability (ADR-0003 Tier-1 cooperative core)."
+
+[dependencies]
+cap-core = { path = "../cap-core" }   # the Sched Budget model (per-cap CPU-time allotment)
+
+[lints.rust]
+warnings = "deny"                     # AC0.3: -D warnings clean
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"   # GC-06: every unsafe block carries a // SAFETY: note

@@ -7,6 +7,7 @@
 
 use crate::cap::{Cap, CapType, ObjectType, RawCap};
 use crate::rights::Rights;
+use crate::sched::Budget;
 
 /// A capability pointer: an index into the (single-level, P2) root CNode.
 pub type Cptr = usize;
@@ -55,6 +56,10 @@ impl Cte {
 pub struct CSpace<const N: usize> {
     slots: [Cte; N],
     zero: fn(u64, u32),
+    /// Monotonic id source for objects with no physical `objref` (e.g. `Sched`, which is
+    /// pure CPU-time accounting, not frame-backed). Frame-backed objects use their frame
+    /// number as `objref`; `Sched` objrefs are drawn from here so each is a distinct identity.
+    next_obj: u64,
 }
 
 impl<const N: usize> CSpace<N> {
@@ -64,6 +69,7 @@ impl<const N: usize> CSpace<N> {
         Self {
             slots: [Cte::EMPTY; N],
             zero,
+            next_obj: 1,
         }
     }
 
@@ -81,6 +87,30 @@ impl<const N: usize> CSpace<N> {
                 objref: base,
                 size: frames,
                 watermark: 0,
+                aux: 0,
+                badge: 0,
+            },
+            parent: NIL,
+        };
+    }
+
+    /// Install a primordial `Sched` capability (CPU-time `budget` per `period`) at `slot` —
+    /// the kernel's initial CPU-time authority (SPEC-CAP §6) and the root of the `Sched`
+    /// derivation tree. Like [`set_root_untyped`](Self::set_root_untyped), a trusted boot-path
+    /// bootstrap; `slot` must be a valid, empty slot. `DERIVE` authorizes SPLIT/DELEGATE; a
+    /// `Sched` is never COPY/MINT-able (its per-cap budget would fork — see [`mint`](Self::mint)).
+    pub fn set_root_sched(&mut self, slot: Cptr, budget: u32, period: u32) {
+        debug_assert!(slot < N, "set_root_sched: slot out of bounds");
+        let objref = self.next_obj;
+        self.next_obj += 1;
+        self.slots[slot] = Cte {
+            cap: RawCap {
+                cap_type: CapType::Sched,
+                rights: Rights::DERIVE,
+                objref,
+                size: budget,
+                watermark: 0, // consumed this period
+                aux: period,
                 badge: 0,
             },
             parent: NIL,
@@ -176,6 +206,7 @@ impl<const N: usize> CSpace<N> {
                     objref,
                     size: frames_per_obj,
                     watermark: 0,
+                    aux: 0,
                     badge: 0,
                 },
                 parent: ut,
@@ -194,9 +225,11 @@ impl<const N: usize> CSpace<N> {
         badge: u64,
     ) -> Result<(), CapError> {
         let s = self.live(src)?;
-        if s.cap_type == CapType::Untyped {
-            // An Untyped is never duplicable: its per-cap watermark would fork, forking the
-            // budget and aliasing frames (§8/§2.1). Sub-allocation is a future SPLIT, not MINT.
+        if matches!(s.cap_type, CapType::Untyped | CapType::Sched) {
+            // Untyped and Sched are never duplicable: both carry per-cap allocation state
+            // (Untyped's retype watermark; Sched's CPU-time budget), so a COPY/MINT would
+            // fork it — forking the frame budget (§8/§2.1) or forging CPU time (DEC-0003-2).
+            // Sub-allocation goes through RETYPE (Untyped) / SPLIT (Sched), never MINT.
             return Err(CapError::InsufficientRights);
         }
         if !s.rights.contains(Rights::DERIVE) {
@@ -220,8 +253,8 @@ impl<const N: usize> CSpace<N> {
     /// the MDB (same parent), so a revoke of an ancestor treats copies alike.
     pub fn copy(&mut self, src: Cptr, dest: Cptr) -> Result<(), CapError> {
         let s = self.live(src)?;
-        if s.cap_type == CapType::Untyped {
-            return Err(CapError::InsufficientRights); // Untyped is never duplicable (see mint)
+        if matches!(s.cap_type, CapType::Untyped | CapType::Sched) {
+            return Err(CapError::InsufficientRights); // Untyped/Sched are never duplicable (see mint)
         }
         if !s.rights.contains(Rights::DERIVE) {
             return Err(CapError::InsufficientRights);
@@ -253,6 +286,66 @@ impl<const N: usize> CSpace<N> {
         }
         self.slots[dest] = e;
         self.slots[src] = Cte::EMPTY;
+        Ok(())
+    }
+
+    // ---- Sched budget derivation (SPEC-CAP §6, ADR-0003 DEC-0003-4) ----
+
+    /// SPLIT a `Sched`: carve `amount` CPU-time budget out of `src` into a **new** child
+    /// `Sched` at `dest`. Monotonic — total budget is conserved (`src` loses exactly what
+    /// `dest` gains), so a split creates no CPU time. The child is a derivation child of
+    /// `src`, so revoking `src` reclaims it. All-or-nothing: if `dest` is occupied/out of
+    /// bounds or `amount` exceeds `src`'s available budget, `src` is left untouched.
+    pub fn split(&mut self, src: Cptr, dest: Cptr, amount: u32) -> Result<(), CapError> {
+        let s = self.live(src)?;
+        if s.cap_type != CapType::Sched {
+            return Err(CapError::WrongType);
+        }
+        if !s.rights.contains(Rights::DERIVE) {
+            return Err(CapError::InsufficientRights);
+        }
+        let mut parent = Budget::from_cap(&s);
+        let child = parent.split(amount).ok_or(CapError::OutOfBudget)?;
+        let objref = self.next_obj;
+        let child_cap = RawCap {
+            cap_type: CapType::Sched,
+            rights: s.rights,
+            objref,
+            size: child.capacity,
+            watermark: child.consumed,
+            aux: child.period,
+            badge: 0,
+        };
+        // place() validates dest BEFORE we commit the debit to src (all-or-nothing).
+        self.place(dest, child_cap, src)?;
+        parent.write_into(&mut self.slots[src].cap);
+        self.next_obj += 1;
+        Ok(())
+    }
+
+    /// DELEGATE: transfer `amount` CPU-time budget from `src` into an existing `Sched` at
+    /// `dest`. Monotonic — the total across the two is unchanged. This is the passive-server
+    /// primitive (DEC-0003-4): a caller hands budget to a server so the server runs on the
+    /// caller's time (P4 wires it to the IPC call path). A self-delegate is a no-op.
+    pub fn delegate(&mut self, src: Cptr, dest: Cptr, amount: u32) -> Result<(), CapError> {
+        if src == dest {
+            return Ok(());
+        }
+        let s = self.live(src)?;
+        let d = self.live(dest)?;
+        if s.cap_type != CapType::Sched || d.cap_type != CapType::Sched {
+            return Err(CapError::WrongType);
+        }
+        if !s.rights.contains(Rights::DERIVE) {
+            return Err(CapError::InsufficientRights);
+        }
+        let mut src_b = Budget::from_cap(&s);
+        let mut dst_b = Budget::from_cap(&d);
+        if !src_b.delegate(&mut dst_b, amount) {
+            return Err(CapError::OutOfBudget);
+        }
+        src_b.write_into(&mut self.slots[src].cap);
+        dst_b.write_into(&mut self.slots[dest].cap);
         Ok(())
     }
 
@@ -314,14 +407,28 @@ impl<const N: usize> CSpace<N> {
         if cap.is_null() {
             return;
         }
+        let parent = self.slots[d].parent;
         self.slots[d] = Cte::EMPTY;
+        // Return a destroyed Sched's remaining budget to its Sched parent — CPU-time is
+        // conserved across revoke/delete, not leaked. The parent granted this budget via SPLIT,
+        // so reclaiming it on destruction is the CPU-time analogue of an Untyped reclaiming its
+        // frames when a retyped child is destroyed. Leaf-first revocation means a subtree's
+        // budget flows back up one level per destroyed node until it reaches the revoked root.
+        if cap.cap_type == CapType::Sched && parent != NIL {
+            let p = &mut self.slots[parent].cap;
+            if p.cap_type == CapType::Sched {
+                p.size = p.size.saturating_add(cap.size);
+            }
+        }
         // Zero the object if this was its last capability (CAP-REVOKE-2 no-residual). Untyped
-        // memory is zeroed on the next RETYPE (CAP-MEM-2), so it needs no zeroing here.
+        // memory is zeroed on the next RETYPE (CAP-MEM-2), so it needs no zeroing here; Sched
+        // is pure CPU-time accounting with no backing frames (its `size` is a budget, not a
+        // frame count), so zeroing it would scribble `budget` frames at a bogus address.
         let another = (0..N).any(|k| {
             let c = self.slots[k].cap;
             !c.is_null() && c.cap_type as u8 == cap.cap_type as u8 && c.objref == cap.objref
         });
-        if !another && cap.cap_type != CapType::Untyped {
+        if !another && !matches!(cap.cap_type, CapType::Untyped | CapType::Sched) {
             (self.zero)(cap.objref, cap.size);
         }
     }
@@ -347,12 +454,14 @@ impl<const N: usize> CSpace<N> {
 }
 
 /// Object types RETYPE can produce from `Untyped`. Excludes `Null` (the empty marker),
-/// `Untyped` (no sub-retype in the single-level model — it would fork the watermark), and
-/// `Reply`/`IrqControl` (kernel-minted, not retyped — CAP-REPLY-1).
+/// `Untyped` (no sub-retype in the single-level model — it would fork the watermark),
+/// `Reply`/`IrqControl` (kernel-minted, not retyped — CAP-REPLY-1), and `Sched` (created
+/// with an explicit budget+period via [`set_root_sched`](CSpace::set_root_sched) / SPLIT, so
+/// a RETYPE — which has no budget argument — could only make a malformed zero-period Sched).
 fn is_retypeable(t: CapType) -> bool {
     !matches!(
         t,
-        CapType::Null | CapType::Untyped | CapType::Reply | CapType::IrqControl
+        CapType::Null | CapType::Untyped | CapType::Reply | CapType::IrqControl | CapType::Sched
     )
 }
 
@@ -559,5 +668,142 @@ mod tests {
             0,
             "refused retypes charge nothing"
         );
+    }
+
+    // ---- Sched (P3a) ----
+
+    fn budget_of<const N: usize>(cs: &CSpace<N>, c: Cptr) -> Budget {
+        Budget::from_cap(&cs.resolve(c).unwrap())
+    }
+
+    #[test]
+    fn sched_split_conserves_budget_and_scopes_to_revoke() {
+        let mut cs = CSpace::<16>::new(nz);
+        cs.set_root_sched(0, 100, 50); // root Sched: 100 units / 50 period
+        assert_eq!(cs.resolve(0).unwrap().cap_type, CapType::Sched);
+        // SPLIT 30 into slot 1, then 20 into slot 2.
+        cs.split(0, 1, 30).unwrap();
+        cs.split(0, 2, 20).unwrap();
+        assert_eq!(budget_of(&cs, 0).capacity, 50, "root debited by 30+20");
+        assert_eq!(budget_of(&cs, 1).capacity, 30);
+        assert_eq!(budget_of(&cs, 2).capacity, 20);
+        assert_eq!(budget_of(&cs, 1).period, 50, "child inherits period");
+        // Conservation across the whole tree.
+        let total =
+            budget_of(&cs, 0).capacity + budget_of(&cs, 1).capacity + budget_of(&cs, 2).capacity;
+        assert_eq!(total, 100, "no CPU time created by splitting");
+        // Each Sched is a distinct object identity.
+        assert_ne!(cs.resolve(0).unwrap().objref, cs.resolve(1).unwrap().objref);
+        // REVOKE the root: children destroyed, root kept — and their budget flows BACK to the
+        // root (CPU-time conserved across revoke, not leaked).
+        cs.revoke(0).unwrap();
+        assert_eq!(cs.resolve(1), Err(CapError::EmptySlot));
+        assert_eq!(cs.resolve(2), Err(CapError::EmptySlot));
+        assert!(cs.resolve(0).is_ok());
+        assert_eq!(
+            budget_of(&cs, 0).capacity,
+            100,
+            "revoke reclaims child budget to the root (no CPU time lost)"
+        );
+    }
+
+    #[test]
+    fn sched_revoke_reclaims_budget_transitively() {
+        // root → A → B (a 2-level Sched tree). Revoking the root must funnel B's budget up
+        // through A back to root, leaf-first, conserving the full 100 units.
+        let mut cs = CSpace::<8>::new(nz);
+        cs.set_root_sched(0, 100, 10);
+        cs.split(0, 1, 60).unwrap(); // A ← 60 (root 40)
+        cs.split(1, 2, 25).unwrap(); // B ← 25 from A (A 35)
+        assert_eq!(budget_of(&cs, 0).capacity, 40);
+        assert_eq!(budget_of(&cs, 1).capacity, 35);
+        assert_eq!(budget_of(&cs, 2).capacity, 25);
+        cs.revoke(0).unwrap();
+        assert_eq!(cs.resolve(1), Err(CapError::EmptySlot));
+        assert_eq!(cs.resolve(2), Err(CapError::EmptySlot));
+        assert_eq!(
+            budget_of(&cs, 0).capacity,
+            100,
+            "transitive reclaim: B→A→root conserves all CPU time"
+        );
+    }
+
+    #[test]
+    fn sched_split_over_budget_is_all_or_nothing() {
+        let mut cs = CSpace::<8>::new(nz);
+        cs.set_root_sched(0, 40, 10);
+        assert_eq!(cs.split(0, 1, 41), Err(CapError::OutOfBudget));
+        assert_eq!(
+            budget_of(&cs, 0).capacity,
+            40,
+            "refused split leaves root untouched"
+        );
+        assert_eq!(cs.resolve(1), Err(CapError::EmptySlot), "no child placed");
+        // A split whose destination is occupied must not debit the source either.
+        cs.split(0, 1, 10).unwrap();
+        assert_eq!(cs.split(0, 1, 5), Err(CapError::SlotOccupied));
+        assert_eq!(
+            budget_of(&cs, 0).capacity,
+            30,
+            "occupied-dest split did not debit source"
+        );
+    }
+
+    #[test]
+    fn sched_delegate_transfers_and_conserves() {
+        let mut cs = CSpace::<8>::new(nz);
+        cs.set_root_sched(0, 100, 10);
+        cs.split(0, 1, 40).unwrap(); // slot1 has 40, root now 60
+        cs.delegate(0, 1, 25).unwrap();
+        assert_eq!(budget_of(&cs, 0).capacity, 35);
+        assert_eq!(budget_of(&cs, 1).capacity, 65);
+        assert_eq!(budget_of(&cs, 0).capacity + budget_of(&cs, 1).capacity, 100);
+        // Over-available delegation refused, both untouched.
+        assert_eq!(cs.delegate(0, 1, 36), Err(CapError::OutOfBudget));
+        assert_eq!(budget_of(&cs, 0).capacity, 35);
+        assert_eq!(budget_of(&cs, 1).capacity, 65);
+        // Self-delegate is a harmless no-op (must NOT double-credit).
+        cs.delegate(1, 1, 10).unwrap();
+        assert_eq!(
+            budget_of(&cs, 1).capacity,
+            65,
+            "self-delegate created no budget"
+        );
+    }
+
+    #[test]
+    fn sched_is_never_duplicable_or_retypeable() {
+        // Like Untyped: duplicating a Sched would fork its per-cap budget (CPU-time forgery).
+        let mut cs = CSpace::<8>::new(nz);
+        cs.set_root_sched(0, 50, 10);
+        assert_eq!(cs.copy(0, 1), Err(CapError::InsufficientRights));
+        assert_eq!(
+            cs.mint(0, 1, Rights::DERIVE, 0),
+            Err(CapError::InsufficientRights)
+        );
+        // And a Sched cannot be conjured by RETYPE (no budget argument ⇒ malformed).
+        let mut cu = CSpace::<8>::new(nz);
+        cu.set_root_untyped(0, 64);
+        assert_eq!(
+            cu.retype(0, CapType::Sched, 1, 1, 1),
+            Err(CapError::WrongType)
+        );
+    }
+
+    #[test]
+    fn sched_destroy_does_not_zero_frames() {
+        // A Sched has no backing frames; destroying it must NOT invoke the frame-zeroing hook
+        // (its `size` is a budget, not a frame count — zeroing would scribble memory).
+        use core::cell::Cell;
+        thread_local!(static ZEROED: Cell<u32> = const { Cell::new(0) });
+        fn rec(_objref: u64, _n: u32) {
+            ZEROED.with(|z| z.set(z.get() + 1));
+        }
+        let mut cs = CSpace::<8>::new(rec);
+        cs.set_root_sched(0, 1_000_000, 10); // huge "size" — would be catastrophic if zeroed
+        cs.split(0, 1, 500_000).unwrap();
+        cs.delete(1).unwrap(); // destroy a Sched
+        cs.delete(0).unwrap();
+        ZEROED.with(|z| assert_eq!(z.get(), 0, "Sched destruction must never zero frames"));
     }
 }

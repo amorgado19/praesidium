@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario mem|p0-rich] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -168,6 +168,19 @@ const P2_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P2-OK",
 ];
 
+/// P3a (sched): P2 plus the kernel heap, Sched budget accounting, and the cooperative
+/// executor. (Preemption / AC3.3 is P3b — not asserted here.)
+const P3A_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P2-OK",
+    "KiB kernel heap",                // heap carved from the buddy is up
+    "SPLIT/DELEGATE monotonic",       // AC3.4: budget conserved
+    "Sched subtree revoked cleanly",  // Sched revoke destroys no frames
+    "cooperative yields interleaved", // AC3.1: executor interleaves Futures
+    "budget gated task A",            // AC3.2: depleted Sched ⇒ parked
+    "replenishment resumed task A",   // CAP-SCHED-1 lifts on replenish
+    "PRAESIDIUM-P3A-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -186,6 +199,12 @@ const SCENARIOS: &[Scenario] = &[
         required: P2_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P2-OK",
+    },
+    Scenario {
+        name: "sched",
+        required: P3A_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P3A-OK",
     },
 ];
 
@@ -217,7 +236,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario mem|p0-rich] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -234,9 +253,10 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
-    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "cap".into());
-    let sc = scenario(&scenario_name)
-        .ok_or_else(|| format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap)"))?;
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "sched".into());
+    let sc = scenario(&scenario_name).ok_or_else(|| {
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched)")
+    })?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))
         .transpose()?

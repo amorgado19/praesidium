@@ -1,0 +1,18 @@
+# GC-07 / ADR-0003 DEC-0003-6 — "no raw lock held across an `.await`", lint-enforced.
+#
+# The single load-bearing discipline of the async executor: a spinlock guard alive across a
+# yield point can deadlock the cooperative core (the task parks holding the lock; whoever it
+# yields to needs the same lock; neither makes progress) and, once preemption lands (P3b), is
+# an interrupt-context reentrancy hazard. This is NOT left to review vigilance — clippy's
+# `await_holding_invalid_types` flags any of these guard types held across an `.await`.
+#
+# Extend this list as new lock-guard types appear (e.g. per-subsystem locks). The kernel crate
+# denies the lint (see kernel/[lints.clippy]); P3b/P4's async IPC + scheduler code is where it
+# earns its keep.
+# NB: the path root is the *crate* name — the kernel's bin target is `praesidium`
+# ([[bin]] name), not `kernel`, so the guard's path is `praesidium::sync::SpinGuard`.
+# clippy silently ignores an unresolvable path, so this is verified to actually fire (a
+# deliberate lock-across-await probe was confirmed to trip it during P3a bring-up).
+await-holding-invalid-types = [
+    { path = "praesidium::sync::SpinGuard", reason = "GC-07: a SpinLock guard must be dropped before any .await (ADR-0003 DEC-0003-6)" },
+]

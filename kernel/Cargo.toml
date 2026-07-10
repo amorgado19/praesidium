@@ -22,9 +22,13 @@ path = "src/main.rs"
 cap-core = { path = "../cap-core" }
 abi      = { path = "../abi" }
 mem      = { path = "../mem" }
+sched    = { path = "../sched" }        # P3: async executor + Sched-budget runnability
 log.workspace       = true
 bitflags.workspace  = true
 static_assertions.workspace = true
+# Kernel-internal heap for the executor (Box<dyn Future>, run queue). Backed by a buddy-carved
+# region (kernel-owned Untyped), not an ambient pool — see kernel/src/heap.rs.
+linked_list_allocator = "0.10"
 
 # ----------------------------------------------------------------------------------------
 # Arch-specific dependencies (ADR-0007 seam). These are the ONLY places arch crates appear;
@@ -44,3 +48,4 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"   # GC-06: every unsafe block carries a // SAFETY: note
+await_holding_invalid_type = "deny"   # GC-07: no raw lock held across `.await` (see clippy.toml)

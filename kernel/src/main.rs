@@ -9,12 +9,16 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[macro_use]
 mod serial;
 mod arch;
 mod boot;
 mod cap;
+mod heap;
 mod memory;
+mod sched;
 mod sync;
 
 use boot::handoff::WardenBootInfo;
@@ -46,8 +50,14 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     // P1: bring up the physical memory subsystem (prints PRAESIDIUM-P1-OK on success).
     memory::init(bi);
 
+    // P3a: stand up the kernel heap (carved from the P1 buddy) before anything allocates.
+    heap::init();
+
     // P2: bring up the capability core (prints PRAESIDIUM-P2-OK on success).
     cap::run();
+
+    // P3a: executor + capability scheduling (prints PRAESIDIUM-P3A-OK on success).
+    sched::run();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

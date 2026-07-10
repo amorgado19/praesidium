@@ -36,19 +36,28 @@ pub enum CapType {
 
 /// The type-erased capability record (SPEC-CAP §4 layer 1). Not a pointer: `objref` is an
 /// opaque, kernel-assigned object id (e.g. a physical frame number for `Frame`/`Untyped`),
-/// never an address a holder can dereference. `size`/`watermark` carry the type-specific
-/// state P2 needs (Frame: `size` frames; Untyped: `size` total frames, `watermark`
-/// consumed).
+/// never an address a holder can dereference. `size`/`watermark`/`aux` carry the
+/// **type-specific** state (their meaning depends on `cap_type`):
+///  - `Frame`/`CNode`/`Endpoint`: `size` = frames it occupies.
+///  - `Untyped`: `size` = total frames, `watermark` = frames consumed by RETYPE.
+///  - `Sched` (P3): `size` = CPU-time **budget** (units/period), `watermark` = units
+///    **consumed** this period, `aux` = replenishment **period**. Budget lives *in the cap*
+///    (per-cap, like the Untyped watermark), so `Sched` is non-duplicable — a COPY/MINT
+///    would fork the budget = CPU-time forgery (DEC-0003-2, mirrors the Untyped invariant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawCap {
     pub cap_type: CapType,
     pub rights: Rights,
-    /// Object reference (frame number for Frame/Untyped; object id otherwise).
+    /// Object reference (frame number for Frame/Untyped; opaque object id otherwise).
     pub objref: u64,
-    /// Object size in frames (Frame/CNode/Endpoint = frames it occupies; Untyped = total).
+    /// Type-specific: frames occupied (Frame/CNode/Endpoint), total frames (Untyped), or
+    /// CPU-time budget (Sched).
     pub size: u32,
-    /// Untyped only: frames consumed by RETYPE (monotonic bump).
+    /// Type-specific: frames consumed by RETYPE (Untyped) or CPU-time consumed this period
+    /// (Sched). Zero for other types.
     pub watermark: u32,
+    /// Type-specific auxiliary state. Sched: the replenishment period. Unused (0) otherwise.
+    pub aux: u32,
     /// Provenance stamp set by MINT (SPEC-CAP §2); distinguishes callers, scopes revoke.
     pub badge: u64,
 }
@@ -61,6 +70,7 @@ impl RawCap {
         objref: 0,
         size: 0,
         watermark: 0,
+        aux: 0,
         badge: 0,
     };
 
