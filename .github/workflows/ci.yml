@@ -23,7 +23,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-none
+          - arch: aarch64
+            target: aarch64-unknown-none-softfloat   # soft-float (see .cargo/config.toml)
     steps:
       - uses: actions/checkout@v4
       - name: Provision pinned toolchain (rust-toolchain.toml)
@@ -35,7 +39,7 @@ jobs:
       - name: build kernel (-D warnings via crate [lints])
         run: cargo xtask build --arch ${{ matrix.arch }}
       - name: clippy kernel
-        run: cargo clippy -p kernel --release --target ${{ matrix.arch }}-unknown-none -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+        run: cargo clippy -p kernel --release --target ${{ matrix.target }} -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
       - name: host unit tests (mem allocator + capability core + executor)
         if: matrix.arch == 'x86_64'
         run: cargo test -p mem -p cap-core -p sched

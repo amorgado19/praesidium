@@ -8,6 +8,9 @@
 //! trivially by code that reads a struct and stops).
 #![no_std]
 #![no_main]
+// The x86-64 IDT uses the `x86-interrupt` calling convention for CPU-exception + IRQ handlers
+// (P3b). It is nightly-only; scoped to x86-64 since aarch64 hand-rolls its vector table.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 extern crate alloc;
 

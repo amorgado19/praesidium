@@ -31,7 +31,14 @@ rustflags = [
     "-C", "link-arg=-Tkernel/linker-x86_64.ld",
 ]
 
-[target.aarch64-unknown-none]
+# The aarch64 kernel targets `aarch64-unknown-none-softfloat`, NOT `-none`: it is SOFT-FLOAT (no
+# FP/SIMD codegen), matching x86-64-unknown-none (soft-float by default). The stackful context
+# switch + IRQ stub (P3b) save only the integer register file; a NEON/FP instruction in a
+# preemptible task would let a peer clobber its v-registers across a switch (silent corruption).
+# A soft-float kernel has no live FP state to preserve — the standard kernel posture (userspace FP
+# save/restore is a P7 concern). Rust ties `fp-armv8` to `neon` and forbids disabling them on the
+# hardfloat target, so the soft-float *target* is the blessed way to do this.
+[target.aarch64-unknown-none-softfloat]
 rustflags = [
     "-C", "relocation-model=static",
     "-C", "link-arg=-Tkernel/linker-aarch64.ld",

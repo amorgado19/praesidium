@@ -8,8 +8,53 @@
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
+mod context;
+mod interrupts;
 mod paging;
+mod timer;
+pub use context::{context_init, context_switch, Context};
+pub use interrupts::interrupts_init;
 pub use paging::{activate_address_space, build_address_space, enable_wx, page_prot, translate};
+pub use timer::timer_init;
+
+/// Mask IRQs (disable preemption), returning whether they were enabled before — pass that back
+/// to [`preempt_restore`] to nest correctly. `DAIF.I` is bit 7 when read via `mrs`.
+#[must_use]
+pub fn preempt_disable() -> bool {
+    let daif: u64;
+    // SAFETY: read DAIF, then mask IRQ via `daifset #2` (bit 1 = I). No memory/stack effects.
+    unsafe {
+        asm!("mrs {d}, daif", d = out(reg) daif, options(nomem, nostack, preserves_flags));
+        asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+    daif & (1 << 7) == 0 // I clear ⇒ IRQs were enabled
+}
+
+/// Re-enable IRQs iff they were enabled when [`preempt_disable`] was called.
+pub fn preempt_restore(was_enabled: bool) {
+    if was_enabled {
+        // SAFETY: `daifclr #2` clears DAIF.I, re-enabling IRQs — only what was on before.
+        unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+/// Unconditionally unmask IRQs (a freshly-launched task becomes preemptible).
+pub fn preempt_enable() {
+    // SAFETY: `daifclr #2` clears DAIF.I, enabling IRQ delivery.
+    unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+}
+
+/// Unmask IRQs and wait for one — the idle path.
+pub fn wait_for_interrupt() {
+    // SAFETY: unmask IRQs then `wfi` parks the CPU until an interrupt (e.g. the timer) fires.
+    unsafe {
+        asm!(
+            "msr daifclr, #2",
+            "wfi",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+}
 
 /// ELF entry from Warden (`x0` = the `WardenBootInfo` pointer). Switch to the kernel's
 /// own boot stack (Warden's stack is in allocator-managed RAM), then tail-call

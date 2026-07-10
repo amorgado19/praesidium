@@ -18,7 +18,9 @@ components = [
     "clippy",
 ]
 targets = [
-    "x86_64-unknown-none",   # bare-metal kernel image, x86-64 (ADR-0007 backend)
-    "aarch64-unknown-none",  # bare-metal kernel image, aarch64 (ADR-0007 backend)
+    "x86_64-unknown-none",             # bare-metal kernel image, x86-64 (ADR-0007 backend)
+    "aarch64-unknown-none-softfloat",  # bare-metal kernel image, aarch64 — SOFT-FLOAT: the
+                                       # context switch saves no FP/SIMD state, so the kernel
+                                       # must not emit any (matches x86 soft-float; P3b).
 ]
 profile = "minimal"

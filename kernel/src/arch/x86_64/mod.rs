@@ -6,8 +6,48 @@
 
 use core::arch::asm;
 
+mod context;
+mod interrupts;
 mod paging;
+mod timer;
+pub use context::{context_init, context_switch, Context};
+pub use interrupts::interrupts_init;
 pub use paging::{activate_address_space, build_address_space, enable_wx, page_prot, translate};
+pub use timer::timer_init;
+
+/// Mask maskable interrupts (disable preemption), returning whether they were enabled before —
+/// pass that back to [`preempt_restore`] to nest correctly.
+#[must_use]
+pub fn preempt_disable() -> bool {
+    let flags: u64;
+    // SAFETY: pushfq/pop reads RFLAGS onto the stack then into a GPR; cli clears IF. The block
+    // uses the stack (no `nostack`); IF is not a condition-code flag, so `preserves_flags` holds.
+    unsafe {
+        asm!("pushfq", "pop {f}", "cli", f = out(reg) flags, options(preserves_flags));
+    }
+    flags & (1 << 9) != 0 // RFLAGS.IF
+}
+
+/// Re-enable interrupts iff they were enabled when [`preempt_disable`] was called.
+pub fn preempt_restore(was_enabled: bool) {
+    if was_enabled {
+        // SAFETY: `sti` sets IF; we only re-enable what was on before this critical section.
+        unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+/// Unconditionally enable interrupts (a freshly-launched task becomes preemptible).
+pub fn preempt_enable() {
+    // SAFETY: `sti` enables maskable interrupts. No memory/stack effects.
+    unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
+}
+
+/// Enable interrupts and halt until one arrives — the idle path (`sti; hlt` is atomic wrt the
+/// interrupt window, so a wake that races the halt is not lost).
+pub fn wait_for_interrupt() {
+    // SAFETY: `sti; hlt` enables interrupts then parks the CPU until one fires.
+    unsafe { asm!("sti", "hlt", options(nomem, nostack, preserves_flags)) };
+}
 
 /// ELF entry from Warden (`rdi` = the `WardenBootInfo` pointer). We switch to the
 /// kernel's own boot stack — Warden's stack is in allocator-managed RAM, so we must

@@ -5,11 +5,14 @@
 //! all divergence lives here (DEC-0007-1).
 //!
 //! **Surface so far:** serial ([`serial_init`], [`serial_write_byte`]), CPU control
-//! ([`halt`], [`memory_barrier`]), and — added in P1 — the `VSpace`/translation
-//! primitives ([`build_address_space`], [`activate_address_space`], [`translate`],
-//! [`page_prot`]) that let the kernel build and own its page tables. The seam grows
-//! one method at a time, per phase (DEC-0007-2); I/D cache-maintenance lands with
-//! the phase that first copies-then-executes code (P6).
+//! ([`halt`], [`memory_barrier`]), the `VSpace`/translation primitives (P1:
+//! [`build_address_space`], [`activate_address_space`], [`translate`], [`page_prot`]),
+//! and — added in P3b — the execution primitives: interrupt control
+//! ([`interrupts_init`], [`timer_init`], [`preempt_disable`]/[`preempt_restore`]/
+//! [`preempt_enable`], [`wait_for_interrupt`]) and the stackful context switch
+//! ([`Context`], [`context_init`], [`context_switch`]). The seam grows one method at a
+//! time, per phase (DEC-0007-2); I/D cache-maintenance lands with the phase that first
+//! copies-then-executes code (P6).
 
 /// Memory protection for a mapping. **W^X is structural (CAP-MEM-1):** there is no
 /// writable-and-executable variant, so a W+X mapping is *unrepresentable* — the
@@ -77,16 +80,18 @@ pub struct AddressSpace {
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
-    activate_address_space, build_address_space, enable_wx, halt, memory_barrier, page_prot,
-    serial_init, serial_write_byte, translate,
+    activate_address_space, build_address_space, context_init, context_switch, enable_wx, halt,
+    interrupts_init, memory_barrier, page_prot, preempt_disable, preempt_enable, preempt_restore,
+    serial_init, serial_write_byte, timer_init, translate, wait_for_interrupt, Context,
 };
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
-    activate_address_space, build_address_space, enable_wx, halt, memory_barrier, page_prot,
-    serial_init, serial_write_byte, translate,
+    activate_address_space, build_address_space, context_init, context_switch, enable_wx, halt,
+    interrupts_init, memory_barrier, page_prot, preempt_disable, preempt_enable, preempt_restore,
+    serial_init, serial_write_byte, timer_init, translate, wait_for_interrupt, Context,
 };
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

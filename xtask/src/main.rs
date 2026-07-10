@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -88,7 +88,9 @@ const X86_64: ArchSpec = ArchSpec {
 
 const AARCH64: ArchSpec = ArchSpec {
     name: "aarch64",
-    target: "aarch64-unknown-none",
+    // Soft-float: the P3b context switch preserves only integer registers, so the kernel must
+    // emit no FP/SIMD (matches x86-64-unknown-none, which is soft-float by default).
+    target: "aarch64-unknown-none-softfloat",
     uefi_triple: "aarch64-unknown-uefi",
     esp_dir: "test-assets/esp-a64",
     boot_file: "EFI/BOOT/BOOTAA64.EFI",
@@ -181,6 +183,16 @@ const P3A_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P3A-OK",
 ];
 
+/// P3b (preempt): P3a plus interrupts, the timer, and the stackful scheduler preempting a
+/// non-yielding task — the full P3 gate (AC3.3).
+const PREEMPT_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P3A-OK",
+    "stackful scheduler live", // interrupts + timer up
+    "cooperative Futures interleaved while preemptible", // Tier-1 cooperative under Tier-2
+    "non-yielding hog preempted", // AC3.3: real hardware preemption
+    "PRAESIDIUM-P3-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -205,6 +217,12 @@ const SCENARIOS: &[Scenario] = &[
         required: P3A_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P3A-OK",
+    },
+    Scenario {
+        name: "preempt",
+        required: PREEMPT_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P3-OK",
     },
 ];
 
@@ -236,7 +254,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -253,9 +271,9 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
-    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "sched".into());
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "preempt".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt)")
     })?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))

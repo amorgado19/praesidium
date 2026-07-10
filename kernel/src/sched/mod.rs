@@ -1,27 +1,34 @@
-//! Executor + capability-scheduling integration (P3a).
+//! Executor + capability-scheduling integration (P3).
 //!
 //! Wires the pure `sched` crate (the cooperative async executor) and `cap-core`'s `Sched`
-//! budget model to the running kernel, and runs the P3a boot demo asserting the gates:
+//! budget model to the running kernel, and runs the P3 boot demo asserting the gates:
 //!  - **AC3.4** — `Sched` SPLIT/DELEGATE are monotonic (CPU time conserved), and a `Sched`
 //!    subtree revokes cleanly (destroying a `Sched` never touches frames).
 //!  - **AC3.1** — the executor advances multiple `Future`s cooperatively; their `.await`
 //!    yields interleave them rather than running one to completion first.
 //!  - **AC3.2** — a task's `Sched` budget gates runnability (CAP-SCHED-1): a depleted task is
 //!    parked, not polled, until replenishment.
+//!  - **AC3.3** (P3b) — a non-yielding task is **preempted** by the hardware timer so another
+//!    task progresses; the [`scheduler`] provides the stackful context switch this needs.
 //!
-//! The **preemptive fallback** (AC3.3) and its context-switch machinery are P3b; here the
-//! executor is driven purely cooperatively and replenishment is a logical period tick. No
-//! capability is fabricated here — every `Cap`/`Budget` comes from `cap-core` (CAP-RUST-1).
-//!
-//! SCH-T8 (endpoint-waker hook): the mechanism P4 will use lives in the `sched` crate
-//! ([`sched::Executor::endpoint_waker`]); P3a builds no IPC, so nothing is wired to it yet.
+//! P3a (AC3.1/3.2/3.4) runs the async executor cooperatively with a logical replenishment tick.
+//! P3b then stands up interrupts + the timer + the stackful [`scheduler`] and runs the executor
+//! **as a task** alongside a non-yielding hog — proving the two ADR-0003 tiers (cooperative
+//! primary + preemptive fallback) compose. No capability is fabricated here — every
+//! `Cap`/`Budget` comes from `cap-core` (CAP-RUST-1).
 
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cap_core::{Budget, CSpace, CapError};
 use sched::{yield_now, Executor, Task};
+
+use crate::arch;
+
+pub(crate) mod scheduler;
+pub use scheduler::task_enter;
 
 /// Slots for the `Sched` demo CSpace (single root CNode).
 const SLOTS: usize = 16;
@@ -43,12 +50,103 @@ fn fatal_err(op: &str, e: CapError) -> ! {
     crate::arch::halt();
 }
 
-/// Run the P3a milestone: `Sched` capability accounting + the cooperative executor. Prints
-/// `PRAESIDIUM-P3A-OK` on success; any violated invariant fails the boot closed.
+/// Run P3: the `Sched` capability model + cooperative executor (P3a), then the preemptive
+/// stackful scheduler (P3b). Prints `PRAESIDIUM-P3A-OK` after the cooperative half and
+/// `PRAESIDIUM-P3-OK` after preemption; any violated invariant fails the boot closed.
 pub fn run() {
     demo_sched_caps();
     demo_executor();
     kprintln!("[praesidium] PRAESIDIUM-P3A-OK");
+    demo_preemption();
+    kprintln!("[praesidium] PRAESIDIUM-P3-OK");
+}
+
+/// The preemption timer frequency. aarch64 derives a precise rate from `CNTFRQ`; x86 uses a
+/// nominal (uncalibrated) LAPIC count — either way fast enough to preempt a spinning task.
+const PREEMPT_HZ: u32 = 100;
+
+/// Ticked forever by the non-yielding hog task; the worker reads it to prove the hog ran (and
+/// was therefore preempted, since it never yields).
+static HOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Set by the worker task when it has demonstrated preemption; drives the boot task's exit.
+static WORKER_DONE: AtomicBool = AtomicBool::new(false);
+
+/// AC3.3 + integration — real hardware preemption of a non-yielding task, with the cooperative
+/// async executor running as a task under the same scheduler.
+fn demo_preemption() {
+    arch::interrupts_init();
+    scheduler::bootstrap();
+    arch::timer_init(PREEMPT_HZ);
+    kprintln!("[praesidium] sched: interrupts + {PREEMPT_HZ}Hz timer up; stackful scheduler live");
+
+    // A non-yielding CPU hog + the cooperative executor as a task. The hog never yields, so the
+    // worker can only get the CPU if the timer preempts the hog.
+    scheduler::spawn(hog_task, Budget::new(u32::MAX, u32::MAX));
+    scheduler::spawn(worker_task, Budget::new(u32::MAX, u32::MAX));
+
+    // Drive from the boot/idle task until the worker signals success.
+    while !WORKER_DONE.load(Ordering::Acquire) {
+        scheduler::yield_now();
+    }
+    // Mask preemption before returning so the still-spinning hog can't be scheduled again between
+    // here and the kernel's final halt — a clean shutdown, not a live-locked CPU.
+    let _ = arch::preempt_disable();
+    kprintln!("[praesidium] sched: preemption demo complete; scheduler parked");
+}
+
+/// The adversarial non-cooperator: spins forever, never yielding or awaiting. Only preemption
+/// can take the CPU from it.
+fn hog_task() {
+    loop {
+        HOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+}
+
+/// The cooperative worker, run as a stackful task: it runs the P3a async executor (Tier-1
+/// cooperative Futures) to completion — which can only happen because the timer preempted the
+/// never-yielding hog to schedule this task — then confirms ongoing preemptive time-sharing.
+fn worker_task() {
+    // Tier 1 under Tier 2: the async executor advances cooperative Futures while this whole task
+    // is itself subject to preemption.
+    let log: Rc<RefCell<Vec<char>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut ex = Executor::new();
+    ex.spawn(Task::new(
+        worker(log.clone(), 'X', 4),
+        Budget::new(1000, 1000),
+    ));
+    ex.spawn(Task::new(
+        worker(log.clone(), 'Y', 4),
+        Budget::new(1000, 1000),
+    ));
+    ex.run_until_idle();
+    {
+        let l = log.borrow();
+        if l.len() < 4 || !(l[0] == 'X' && l[1] == 'Y' && l[2] == 'X' && l[3] == 'Y') {
+            fatal("cooperative executor did not interleave while under preemption");
+        }
+    }
+    // We are running, yet the hog never yields — so the timer must have preempted it. Confirm the
+    // hog actually got the CPU first (spun ≥ once) before being preempted to schedule us.
+    if HOG_COUNTER.load(Ordering::Relaxed) == 0 {
+        fatal("hog never ran — preemption evidence inconclusive");
+    }
+    kprintln!("[praesidium] sched: cooperative Futures interleaved while preemptible (Tier-1 under Tier-2)");
+
+    // Ongoing time-sharing: yield the CPU a few times and confirm the hog advances each time we
+    // are descheduled, then preemption returns the CPU to us.
+    for _ in 0..3 {
+        let before = HOG_COUNTER.load(Ordering::Relaxed);
+        scheduler::yield_now();
+        if HOG_COUNTER.load(Ordering::Relaxed) <= before {
+            fatal("hog made no progress across a yield — scheduler not round-robining");
+        }
+    }
+    kprintln!(
+        "[praesidium] sched: non-yielding hog preempted (spun {} ticks); worker made progress (AC3.3)",
+        HOG_COUNTER.load(Ordering::Relaxed)
+    );
+    WORKER_DONE.store(true, Ordering::Release);
 }
 
 /// AC3.4 — `Sched` SPLIT/DELEGATE conserve CPU time, and a `Sched` subtree revokes cleanly.
