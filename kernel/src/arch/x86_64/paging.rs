@@ -230,3 +230,59 @@ pub fn page_prot(vaddr: u64) -> Option<(bool, bool)> {
     let (leaf, _) = walk(vaddr)?;
     Some((leaf & WRITABLE != 0, leaf & NX == 0))
 }
+
+/// Invalidate any TLB entry (4 KiB or 2 MiB) caching a translation for `vaddr`.
+fn invlpg(vaddr: u64) {
+    // SAFETY: `invlpg` flushes the TLB entry for the given linear address and has no
+    // other effect; the operand is a memory reference (so no `nomem`).
+    unsafe { asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags)) };
+}
+
+/// Install a **guard page** (isolation Layer 3, ADR-0008): render the 4 KiB page at `vaddr`
+/// non-present in the *active* tables, first **splitting** the covering 2 MiB huge page down
+/// to 4 KiB granularity if necessary (the HHDM is huge-page-mapped). A stack overflow into the
+/// guard then `#PF`s loudly instead of silently corrupting the neighbouring allocation. The
+/// TLB entry for `vaddr` is flushed so the change takes effect immediately.
+///
+/// The split preserves every other translation in the 2 MiB window (same physical base, same
+/// attributes) — only the one guard page changes — so it is safe to apply to the live kernel
+/// tables. The new PT is built in full *before* the PD entry is swung from huge-page to
+/// table-pointer (a single aligned 64-bit store), so the page-table walker never observes a
+/// half-built table.
+///
+/// # Safety
+/// `vaddr` must name a page the caller owns and intends to make inaccessible — e.g. the frame
+/// immediately below a freshly-allocated task stack. In a single address space the HHDM alias
+/// is the *only* mapping of that frame, so unmapping a page still used elsewhere would fault
+/// that user. The caller must not later free the underlying frame without first restoring the
+/// mapping (a re-allocated frame would otherwise inherit a non-present HHDM alias).
+pub unsafe fn install_guard_page(vaddr: u64) {
+    let v = vaddr & !0xfff; // page-align
+    let e4 = read_entry(current_pml4(), idx(v, 3));
+    assert!(e4 & PRESENT != 0, "guard page: PML4 entry absent");
+    let e3 = read_entry(e4 & ADDR_MASK, idx(v, 2));
+    assert!(
+        e3 & PRESENT != 0 && e3 & HUGE == 0,
+        "guard page: unexpected 1 GiB mapping"
+    );
+    let pd = e3 & ADDR_MASK;
+    let e2 = read_entry(pd, idx(v, 1));
+    assert!(e2 & PRESENT != 0, "guard page: PD entry absent");
+
+    let pt = if e2 & HUGE != 0 {
+        // Split the 2 MiB huge page into 512 × 4 KiB entries with identical attributes.
+        let base = e2 & ADDR_MASK & !0x1f_ffff; // 2 MiB-aligned physical base
+        let flags = e2 & !ADDR_MASK & !HUGE; // PRESENT|WRITABLE|NX (drop the PS/huge bit)
+        let new_pt = alloc_table();
+        for j in 0..512u64 {
+            write_entry(new_pt, j as usize, (base + j * PAGE) | flags);
+        }
+        write_entry(pd, idx(v, 1), new_pt | PRESENT | WRITABLE);
+        new_pt
+    } else {
+        e2 & ADDR_MASK
+    };
+
+    write_entry(pt, idx(v, 0), 0); // non-present ⇒ the guard
+    invlpg(v);
+}

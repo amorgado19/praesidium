@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -95,7 +95,10 @@ const AARCH64: ArchSpec = ArchSpec {
     esp_dir: "test-assets/esp-a64",
     boot_file: "EFI/BOOT/BOOTAA64.EFI",
     qemu: "qemu-system-aarch64",
-    machine: &["-machine", "virt", "-cpu", "cortex-a72"],
+    // `-cpu max` (Armv8.5+) + `mte=on` so the machine emulates FEAT_MTE — the P5 hardware
+    // isolation backstop (synchronous EL1 tag-check faults). cortex-a72 (Armv8.0) has no MTE/PAC.
+    // Precondition (verified before P5 MTE plumbing): P0-P4 still boot green on this CPU model.
+    machine: &["-machine", "virt,mte=on", "-cpu", "max"],
     default_timeout: 180,
     tpm_device: "tpm-tis-device",
     warden_efi_env: "WARDEN_EFI_A64",
@@ -206,6 +209,18 @@ const IPC_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P4-OK",
 ];
 
+/// P5a (isolation): P4 plus the SASOS isolation backstop foundation (ADR-0008) — Layer 1
+/// compile-time nameability, Layer 3 guard pages + W^X re-verify + zero, and capability-gated
+/// domain entry (AC5.1/AC5.3, DEC-0008-5). Hardware Layer 2 (MTE) + the escape test are P5b.
+const ISOLATION_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P4-OK",
+    "Cap<T> unforgeable outside cap-core",   // Layer 1 (AC5.1)
+    "guard page unmapped, neighbour intact", // Layer 3 guard pages (AC5.3)
+    "W^X re-verified",                       // Layer 3 W^X + zero (AC5.3)
+    "domain entry is capability-gated, never ambient", // DEC-0008-5
+    "PRAESIDIUM-P5A-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -243,6 +258,12 @@ const SCENARIOS: &[Scenario] = &[
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P4-OK",
     },
+    Scenario {
+        name: "isolation",
+        required: ISOLATION_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P5A-OK",
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -273,7 +294,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -290,9 +311,9 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
-    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "ipc".into());
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "isolation".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation)")
     })?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))

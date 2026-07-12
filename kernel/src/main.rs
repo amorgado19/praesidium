@@ -21,6 +21,7 @@ mod boot;
 mod cap;
 mod heap;
 mod ipc;
+mod isolation;
 mod memory;
 mod sched;
 mod sync;
@@ -65,6 +66,9 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
 
     // P4: synchronous capability IPC (prints PRAESIDIUM-P4-OK on success).
     ipc::run();
+
+    // P5a: SASOS isolation backstop foundation (prints PRAESIDIUM-P5A-OK on success).
+    isolation::run();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

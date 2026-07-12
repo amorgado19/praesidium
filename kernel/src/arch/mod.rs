@@ -10,9 +10,10 @@
 //! and — added in P3b — the execution primitives: interrupt control
 //! ([`interrupts_init`], [`timer_init`], [`preempt_disable`]/[`preempt_restore`]/
 //! [`preempt_enable`], [`wait_for_interrupt`]) and the stackful context switch
-//! ([`Context`], [`context_init`], [`context_switch`]). The seam grows one method at a
-//! time, per phase (DEC-0007-2); I/D cache-maintenance lands with the phase that first
-//! copies-then-executes code (P6).
+//! ([`Context`], [`context_init`], [`context_switch`]). P5 adds the isolation Layer-3
+//! primitive [`install_guard_page`] (huge-page split + unmap + TLB flush). The seam grows
+//! one method at a time, per phase (DEC-0007-2); I/D cache-maintenance lands with the phase
+//! that first copies-then-executes code (P6).
 
 /// Memory protection for a mapping. **W^X is structural (CAP-MEM-1):** there is no
 /// writable-and-executable variant, so a W+X mapping is *unrepresentable* — the
@@ -81,9 +82,9 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     activate_address_space, build_address_space, context_init, context_switch, enable_wx, halt,
-    interrupts_init, memory_barrier, page_prot, preempt_disable, preempt_enable, preempt_restore,
-    read_translation_root, serial_init, serial_write_byte, timer_init, translate,
-    wait_for_interrupt, Context,
+    install_guard_page, interrupts_init, memory_barrier, page_prot, preempt_disable,
+    preempt_enable, preempt_restore, read_translation_root, serial_init, serial_write_byte,
+    timer_init, translate, wait_for_interrupt, Context,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -91,9 +92,9 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     activate_address_space, build_address_space, context_init, context_switch, enable_wx, halt,
-    interrupts_init, memory_barrier, page_prot, preempt_disable, preempt_enable, preempt_restore,
-    read_translation_root, serial_init, serial_write_byte, timer_init, translate,
-    wait_for_interrupt, Context,
+    install_guard_page, interrupts_init, memory_barrier, page_prot, preempt_disable,
+    preempt_enable, preempt_restore, read_translation_root, serial_init, serial_write_byte,
+    timer_init, translate, wait_for_interrupt, Context,
 };
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

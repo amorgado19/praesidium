@@ -21,9 +21,17 @@ use crate::arch::{self, Context};
 use crate::memory;
 use crate::sync::SpinLock;
 
-/// Order of the per-task kernel stack: 2^2 frames = 16 KiB.
+/// Order of the per-task kernel stack: 2^2 frames = 16 KiB usable.
 const STACK_ORDER: u8 = 2;
 const STACK_BYTES: usize = (1 << STACK_ORDER) * 4096;
+const PAGE: usize = 4096;
+/// Order of the whole stack *block*: the usable stack (4 frames) plus a guard frame
+/// immediately below it, rounded up to the next power of two → 2^3 = 8 frames (32 KiB).
+/// The usable stack sits at the top of the block; the guard is the frame directly beneath
+/// it; the remaining frames below the guard are owned-but-unused slack (isolation Layer 3,
+/// ADR-0008 — closing the P3b/P4 "guard pages below task stacks" deferral).
+const GUARDED_STACK_ORDER: u8 = 3;
+const BLOCK_BYTES: usize = (1 << GUARDED_STACK_ORDER) * PAGE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -112,15 +120,26 @@ pub fn bootstrap() {
 /// Spawn a runnable task with `body` and CPU-time `budget`. Allocates a fresh kernel stack and
 /// primes its context so the first schedule lands in the task body.
 pub fn spawn(body: impl FnOnce() + Send + 'static, budget: Budget) {
-    let phys =
-        memory::alloc_frames(STACK_ORDER).unwrap_or_else(|| fatal("no frames for a task stack"));
-    let stack_top = (memory::phys_to_virt(phys) as usize + STACK_BYTES) as *mut u8;
+    // Allocate the whole guarded block; the usable stack occupies its top `STACK_BYTES`, with a
+    // guard frame directly below the stack's lowest byte.
+    let block = memory::alloc_frames(GUARDED_STACK_ORDER)
+        .unwrap_or_else(|| fatal("no frames for a task stack"));
+    let stack_top = (memory::phys_to_virt(block) as usize + BLOCK_BYTES) as *mut u8;
+    let stack_base_phys = block + (BLOCK_BYTES - STACK_BYTES) as u64;
+    let guard_phys = stack_base_phys - PAGE as u64;
+    // SAFETY: `guard_phys` is the frame immediately below the usable stack, inside our own freshly
+    // allocated block — never handed to anything else — so unmapping its HHDM alias affects only
+    // this allocation. A downward stack overflow past `stack_base_phys` now faults on the guard
+    // instead of corrupting a neighbour. The stack is never freed (see `task_exit`), so the
+    // guard's unmapped alias is never returned to the buddy; a future stack-reclaim path MUST
+    // restore this mapping before freeing the block.
+    unsafe { arch::install_guard_page(memory::phys_to_virt(guard_phys)) };
     // SAFETY: `stack_top` is the exclusive top of `STACK_BYTES` of freshly-allocated, HHDM-mapped,
     // writable stack we own; context_init writes only the small initial frame just below it.
     let context = unsafe { arch::context_init(stack_top) };
     let task = Box::new(Task {
         context,
-        stack_phys: Some(phys),
+        stack_phys: Some(block),
         budget,
         state: State::Runnable,
         body: Some(Box::new(body)),

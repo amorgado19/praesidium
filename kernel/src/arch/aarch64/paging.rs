@@ -215,3 +215,65 @@ pub fn page_prot(vaddr: u64) -> Option<(bool, bool)> {
     let (leaf, _) = walk(vaddr)?;
     Some((leaf & AP_RO == 0, leaf & PXN == 0))
 }
+
+/// Install a **guard page** (isolation Layer 3, ADR-0008): render the 4 KiB page at `vaddr`
+/// invalid in the *active* tables, first **splitting** the covering 2 MiB block down to 4 KiB
+/// (L3) granularity if necessary (the HHDM is block-mapped). A stack overflow into the guard
+/// then takes a translation fault instead of silently corrupting the neighbouring allocation.
+///
+/// The split preserves every other translation in the 2 MiB window (same output base, same
+/// attributes) — only the guard page changes. The L3 table is built in full and published with
+/// a `dsb ishst` *before* the L2 block descriptor is swung to a table descriptor (a single
+/// aligned store), so the walker never observes a half-built table. A `tlbi vaae1is` for the
+/// guard VA evicts any stale block/page TLB entry — the DEC-0007-4 arch-seam obligation.
+///
+/// # Safety
+/// `vaddr` must name a page the caller owns and intends to make inaccessible — e.g. the frame
+/// immediately below a freshly-allocated task stack. In a single address space the HHDM alias
+/// is the *only* mapping of that frame, so unmapping a page still used elsewhere would fault
+/// that user. The caller must not free the underlying frame without first restoring the mapping.
+pub unsafe fn install_guard_page(vaddr: u64) {
+    let v = vaddr & !0xfff; // page-align
+    let root = current_root(v);
+    let e0 = read_entry(root, lidx(v, 0));
+    assert!(e0 & VALID != 0, "guard page: L0 entry absent");
+    let e1 = read_entry(e0 & ADDR_MASK, lidx(v, 1));
+    assert!(
+        e1 & VALID != 0 && e1 & 0b11 == TABLE,
+        "guard page: unexpected L1 block"
+    );
+    let l2 = e1 & ADDR_MASK;
+    let e2 = read_entry(l2, lidx(v, 2));
+    assert!(e2 & VALID != 0, "guard page: L2 entry absent");
+
+    let l3 = if e2 & 0b11 == BLOCK {
+        // Split the 2 MiB block into 512 × 4 KiB L3 pages with identical attributes.
+        let base = e2 & ADDR_MASK & !0x1f_ffff; // 2 MiB-aligned output base
+        let attrs = e2 & !ADDR_MASK & !0b11; // AF|SH|AttrIndx|AP|PXN|UXN (drop the descriptor bits)
+        let new_l3 = alloc_table();
+        for j in 0..512u64 {
+            write_entry(new_l3, j as usize, (base + j * PAGE) | attrs | TABLE);
+        }
+        // SAFETY: `dsb ishst` publishes the L3 stores before the L2 descriptor swing below, so a
+        // walker that follows the new table pointer sees fully-initialised entries.
+        unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+        write_entry(l2, lidx(v, 2), new_l3 | TABLE);
+        new_l3
+    } else {
+        e2 & ADDR_MASK
+    };
+
+    write_entry(l3, lidx(v, 3), 0); // invalid descriptor ⇒ the guard
+                                    // SAFETY: order the guard store, invalidate the VA's last-level TLB entry (block or page),
+                                    // then re-synchronise instruction/translation state — the explicit arch-seam sequence.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {page}",
+            "dsb ish",
+            "isb",
+            page = in(reg) v >> 12,
+            options(nostack, preserves_flags),
+        );
+    }
+}

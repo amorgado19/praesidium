@@ -117,6 +117,43 @@ impl<const N: usize> CSpace<N> {
         };
     }
 
+    /// Install a `Domain` isolation-entry capability at `slot`, naming `domain_id` (the kernel's
+    /// handle for a protection domain — an MTE tag / x86 key / fallback page-table root, P5). It
+    /// carries **only** `ENTER` — never the `VSpace` MAP_TABLE right — so a holder may run *in*
+    /// the domain but can never remap it (which would be an isolation escape, DEC-0008-5). A
+    /// `Domain` is non-duplicable (COPY/MINT refuse it); it is distributed by the kernel or by a
+    /// MOVE-grant, never copied — entry authority cannot be laundered.
+    pub fn set_root_domain(&mut self, slot: Cptr, domain_id: u64) {
+        debug_assert!(slot < N, "set_root_domain: slot out of bounds");
+        self.slots[slot] = Cte {
+            cap: RawCap {
+                cap_type: CapType::Domain,
+                rights: Rights::ENTER,
+                objref: domain_id,
+                size: 0,
+                watermark: 0,
+                aux: 0,
+                badge: 0,
+            },
+            parent: NIL,
+        };
+    }
+
+    /// Capability-gated domain entry (DEC-0008-5): resolve the `Domain` cap at `cptr`, require it
+    /// carries `ENTER`, and return the domain id it authorizes entering. No `Domain` cap (or no
+    /// `ENTER`) ⇒ entry refused — there is no ambient "switch to domain X". The kernel calls this
+    /// before flipping the arch protection domain (MTE tag / key / page-table root).
+    pub fn enter_domain(&self, cptr: Cptr) -> Result<u64, CapError> {
+        let d = self.live(cptr)?;
+        if d.cap_type != CapType::Domain {
+            return Err(CapError::WrongType);
+        }
+        if !d.rights.contains(Rights::ENTER) {
+            return Err(CapError::InsufficientRights);
+        }
+        Ok(d.objref)
+    }
+
     // ---- resolution (SPEC-CAP §3) ----
 
     fn live(&self, c: Cptr) -> Result<RawCap, CapError> {
@@ -227,7 +264,7 @@ impl<const N: usize> CSpace<N> {
         let s = self.live(src)?;
         if matches!(
             s.cap_type,
-            CapType::Untyped | CapType::Sched | CapType::Reply
+            CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain
         ) {
             // Non-duplicable types. Untyped/Sched carry per-cap allocation state (retype
             // watermark; CPU-time budget), so a COPY/MINT would fork it — forking the frame
@@ -260,7 +297,7 @@ impl<const N: usize> CSpace<N> {
         let s = self.live(src)?;
         if matches!(
             s.cap_type,
-            CapType::Untyped | CapType::Sched | CapType::Reply
+            CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain
         ) {
             return Err(CapError::InsufficientRights); // Untyped/Sched/Reply are never duplicable (see mint)
         }
@@ -477,7 +514,7 @@ impl<const N: usize> CSpace<N> {
         if !another
             && !matches!(
                 cap.cap_type,
-                CapType::Untyped | CapType::Sched | CapType::Reply
+                CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain
             )
         {
             (self.zero)(cap.objref, cap.size);
@@ -542,8 +579,13 @@ pub fn grant<const N: usize, const M: usize>(
         // (CAP-REPLY-1); granting it would be the reply-authority-hoarding leak it prevents.
         return Err(CapError::InsufficientRights);
     }
-    if mode == GrantMode::Mint && matches!(s.cap_type, CapType::Untyped | CapType::Sched) {
-        return Err(CapError::InsufficientRights); // a MINT-grant would fork per-cap state
+    if mode == GrantMode::Mint
+        && matches!(
+            s.cap_type,
+            CapType::Untyped | CapType::Sched | CapType::Domain
+        )
+    {
+        return Err(CapError::InsufficientRights); // a MINT-grant would fork per-cap state / domain-entry authority
     }
     if !s.rights.contains(Rights::GRANT) {
         return Err(CapError::InsufficientRights); // the cap must be transferable over IPC
@@ -580,7 +622,12 @@ pub fn grant<const N: usize, const M: usize>(
 fn is_retypeable(t: CapType) -> bool {
     !matches!(
         t,
-        CapType::Null | CapType::Untyped | CapType::Reply | CapType::IrqControl | CapType::Sched
+        CapType::Null
+            | CapType::Untyped
+            | CapType::Reply
+            | CapType::IrqControl
+            | CapType::Sched
+            | CapType::Domain // kernel-managed isolation identity, created via set_root_domain
     )
 }
 
@@ -1220,5 +1267,67 @@ mod tests {
             );
             assert_eq!(client.resolve(1), Err(CapError::EmptySlot));
         }
+    }
+
+    // ---- Domain isolation-entry cap (P5, ADR-0008 DEC-0008-5) ----
+
+    #[test]
+    fn domain_entry_is_capability_gated() {
+        // No ambient "enter domain": entry requires holding the Domain cap.
+        let mut cs = CSpace::<8>::new(nz);
+        cs.set_root_domain(1, 0x00D0_7A11);
+        assert_eq!(
+            cs.enter_domain(1),
+            Ok(0x00D0_7A11),
+            "holding the Domain cap authorizes entry to exactly that domain"
+        );
+        // An empty slot, or a non-Domain cap, refuses cleanly (never UB).
+        assert_eq!(cs.enter_domain(2), Err(CapError::EmptySlot));
+        cs.set_root_untyped(0, 16);
+        assert_eq!(cs.enter_domain(0), Err(CapError::WrongType));
+    }
+
+    #[test]
+    fn domain_is_non_duplicable_carries_only_enter_and_is_not_retypeable() {
+        // A Domain is entry authority: free COPY/MINT would launder the right to run in a domain.
+        let mut cs = CSpace::<8>::new(nz);
+        cs.set_root_domain(1, 42);
+        let d = cs.resolve(1).unwrap();
+        assert_eq!(d.cap_type, CapType::Domain);
+        assert_eq!(
+            d.rights,
+            Rights::ENTER,
+            "carries ENTER only — never VSpace MAP_TABLE"
+        );
+        assert_eq!(cs.copy(1, 2), Err(CapError::InsufficientRights));
+        assert_eq!(
+            cs.mint(1, 2, Rights::ENTER, 0),
+            Err(CapError::InsufficientRights)
+        );
+        assert!(
+            cs.resolve(1).is_ok(),
+            "the domain cap survives refused duplication"
+        );
+        // Kernel-managed identity: never conjured by RETYPE (like Sched/Reply).
+        let mut cu = CSpace::<8>::new(nz);
+        cu.set_root_untyped(0, 64);
+        assert_eq!(
+            cu.retype(0, CapType::Domain, 1, 1, 1),
+            Err(CapError::WrongType)
+        );
+    }
+
+    #[test]
+    fn domain_destroy_zeroes_no_frames() {
+        // A Domain's objref is a domain id, not a frame — destroying it must not call the zero hook.
+        use core::cell::Cell;
+        thread_local!(static Z: Cell<u32> = const { Cell::new(0) });
+        fn rec(_: u64, _: u32) {
+            Z.with(|z| z.set(z.get() + 1));
+        }
+        let mut cs = CSpace::<8>::new(rec);
+        cs.set_root_domain(1, 0xFFFF_FFFF); // huge id — catastrophic if treated as a frame
+        cs.delete(1).unwrap();
+        Z.with(|z| assert_eq!(z.get(), 0, "Domain destruction must never zero frames"));
     }
 }

@@ -32,6 +32,13 @@ pub enum CapType {
     FNode,
     Device,
     IrqControl,
+    /// An isolation domain's entry identity (P5, ADR-0008). Names a protection domain (an MTE
+    /// tag namespace, an x86 protection key, or a fallback page-table root); holding it with
+    /// ENTER authorizes running *in* that domain. Deliberately separate from `VSpace` (the
+    /// translation-structure root): a principal may hold `Domain` (ENTER) without ever holding
+    /// the `VSpace` MAP_TABLE right, so it can run in its domain but never remap it (which would
+    /// be an isolation escape). Kernel-managed identity — non-duplicable, like `Sched`.
+    Domain,
 }
 
 /// The type-erased capability record (SPEC-CAP §4 layer 1). Not a pointer: `objref` is an
@@ -115,6 +122,7 @@ object_types! {
     FNode => FNode,
     Device => Device,
     IrqControl => IrqControl,
+    Domain => Domain,
 }
 
 /// A typed, non-`Copy` capability handle. Holding a `Cap<Frame>` is the only way to name a
@@ -132,13 +140,20 @@ impl<T: ObjectType> Cap<T> {
     /// place `unsafe` constructs a capability (CAP-RUST-1). All derivation
     /// (RETYPE/MINT/COPY) funnels through it inside `cap-core`.
     ///
+    /// `pub(crate)`, deliberately: this makes CAP-RUST-1 **type-enforced, not audit-enforced**.
+    /// Combined with the private fields of `Cap<T>`, it means NO code outside `cap-core` can
+    /// construct a `Cap<T>` at all — the P5 Layer-1 (SASOS type-isolation) guarantee that a
+    /// component with no capability to a region cannot even *name* it (AC5.1). External code
+    /// obtains caps only by value from `CSpace::get`. The `tests/ui/` compile-fail fixture
+    /// regression-guards this: an out-of-crate `fabricate`/field construction must not compile.
+    ///
     /// # Safety
     /// The caller MUST ensure `raw` is a genuine, kernel-authorized capability record —
     /// produced by a legitimate derivation or the primordial bootstrap — and that
     /// `raw.cap_type == T::TYPE`. Fabricating a capability for an object the caller has no
     /// authority over forges authority and breaks the Root Invariant.
     #[must_use]
-    pub unsafe fn fabricate(raw: RawCap) -> Self {
+    pub(crate) unsafe fn fabricate(raw: RawCap) -> Self {
         debug_assert!(
             raw.cap_type as u8 == T::TYPE as u8,
             "cap type mismatch in fabricate"

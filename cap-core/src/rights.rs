@@ -33,6 +33,11 @@ bitflags! {
         const SIGNAL = 1 << 8;
         /// Derive/duplicate capabilities from this one (MINT/COPY authority).
         const DERIVE = 1 << 9;
+        /// Enter an isolation domain (P5, ADR-0008 DEC-0008-5). Held by a principal that may
+        /// *run in* a domain — deliberately distinct from a `VSpace`'s MAP_TABLE (editing a
+        /// domain's translation), so a principal can hold ENTER without ever being able to remap
+        /// its own domain (which would be an isolation escape). Domain entry is never ambient.
+        const ENTER = 1 << 10;
     }
 }
 

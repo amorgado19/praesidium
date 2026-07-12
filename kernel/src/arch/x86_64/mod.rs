@@ -12,7 +12,10 @@ mod paging;
 mod timer;
 pub use context::{context_init, context_switch, Context};
 pub use interrupts::interrupts_init;
-pub use paging::{activate_address_space, build_address_space, enable_wx, page_prot, translate};
+pub use paging::{
+    activate_address_space, build_address_space, enable_wx, install_guard_page, page_prot,
+    translate,
+};
 pub use timer::timer_init;
 
 /// Mask maskable interrupts (disable preemption), returning whether they were enabled before —

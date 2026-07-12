@@ -18,6 +18,11 @@ description  = "Praesidium capability primitives — the only crate allowed to f
 bitflags.workspace = true          # capability rights sets
 static_assertions.workspace = true # layout tripwires on the capability representation
 
+[dev-dependencies]
+# P5 Layer-1 (AC5.1): a compile-fail proof that a Cap<T> is un-constructable outside cap-core,
+# so the SASOS type-isolation guarantee (no cap ⇒ cannot name a region) is mechanically enforced.
+trybuild = "1"
+
 [lints.rust]
 # cap-core is the trust root: unsafe is allowed here (it's the whole point) but must be
 # documented. Everywhere else in the workspace, unsafe should be near-absent.
