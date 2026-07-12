@@ -49,6 +49,17 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("sti", "hlt", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Read the active address-space root(s): `[CR3, 0]` (x86-64 has a single root). Used by P4 to
+/// assert an IPC fast-path call performs **no address-space swap** (AC4.4) — the SASOS win: with
+/// one address space the root is invariant across a call, so no TLB flush / page-table reload.
+#[must_use]
+pub fn read_translation_root() -> [u64; 2] {
+    let cr3: u64;
+    // SAFETY: reading CR3 is side-effect-free.
+    unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
+    [cr3, 0]
+}
+
 /// ELF entry from Warden (`rdi` = the `WardenBootInfo` pointer). We switch to the
 /// kernel's own boot stack — Warden's stack is in allocator-managed RAM, so we must
 /// leave it before the frame allocator runs — then tail-call [`crate::kmain`] with

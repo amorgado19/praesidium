@@ -1,0 +1,27 @@
+# Praesidium fuzz targets. CLAUDE.md mandates `cargo fuzz` for every hostile-input parser;
+# IPC messages are hostile input (ADR-0004 / CLAUDE.md), so the P4 message descriptor decoder
+# is a target. This is a DETACHED workspace (the empty [workspace] below) so the sanitizer +
+# nightly fuzz build never perturbs the kernel workspace's build-std / -D warnings gates.
+#
+# Run: cargo +nightly fuzz run ipc_message
+[package]
+name = "praesidium-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ipc = { path = "../ipc" }
+
+[[bin]]
+name = "ipc_message"
+path = "fuzz_targets/ipc_message.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

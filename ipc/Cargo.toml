@@ -1,0 +1,28 @@
+# ipc — Praesidium synchronous-IPC logic (ADR-0004, P4).
+#
+# Arch-independent, no_std (over `alloc`): the Endpoint rendezvous state machine, the fixed
+# register message format + hostile-input validation, and the Notification signal/wait logic.
+# Deliberately arch-free, executor-free, and entry-point-free — the kernel integration layer
+# (kernel/src/ipc/) wires this to the P3 async executor (wakers), the cap-core cross-CSpace
+# GRANT + Reply mint, and the passive-server budget DELEGATE. Pure enough that `cargo test -p ipc`
+# exercises rendezvous matching, message parsing, and single-use reply flow on the host, and the
+# message parser is a `cargo fuzz` target (IPC messages are hostile input — CLAUDE.md).
+
+[package]
+name         = "ipc"
+version      = "0.0.1"
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Praesidium synchronous capability IPC logic — Endpoint rendezvous, message format, Notification (ADR-0004)."
+
+[dependencies]
+cap-core = { path = "../cap-core" }   # Rights / Cptr / GrantMode for cap-transfer descriptors
+
+[lints.rust]
+warnings = "deny"                     # AC0.3: -D warnings clean
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"   # GC-06: every unsafe block carries a // SAFETY: note

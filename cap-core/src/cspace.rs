@@ -225,11 +225,16 @@ impl<const N: usize> CSpace<N> {
         badge: u64,
     ) -> Result<(), CapError> {
         let s = self.live(src)?;
-        if matches!(s.cap_type, CapType::Untyped | CapType::Sched) {
-            // Untyped and Sched are never duplicable: both carry per-cap allocation state
-            // (Untyped's retype watermark; Sched's CPU-time budget), so a COPY/MINT would
-            // fork it — forking the frame budget (§8/§2.1) or forging CPU time (DEC-0003-2).
-            // Sub-allocation goes through RETYPE (Untyped) / SPLIT (Sched), never MINT.
+        if matches!(
+            s.cap_type,
+            CapType::Untyped | CapType::Sched | CapType::Reply
+        ) {
+            // Non-duplicable types. Untyped/Sched carry per-cap allocation state (retype
+            // watermark; CPU-time budget), so a COPY/MINT would fork it — forking the frame
+            // budget (§8/§2.1) or forging CPU time (DEC-0003-2); sub-allocation is RETYPE /
+            // SPLIT, never MINT. `Reply` is single-use and names exactly one blocked caller
+            // (CAP-REPLY-1): duplicating it would let a server hoard reply authority and reply
+            // to the wrong/old caller — the exact leak the split-out Reply cap exists to prevent.
             return Err(CapError::InsufficientRights);
         }
         if !s.rights.contains(Rights::DERIVE) {
@@ -253,8 +258,11 @@ impl<const N: usize> CSpace<N> {
     /// the MDB (same parent), so a revoke of an ancestor treats copies alike.
     pub fn copy(&mut self, src: Cptr, dest: Cptr) -> Result<(), CapError> {
         let s = self.live(src)?;
-        if matches!(s.cap_type, CapType::Untyped | CapType::Sched) {
-            return Err(CapError::InsufficientRights); // Untyped/Sched are never duplicable (see mint)
+        if matches!(
+            s.cap_type,
+            CapType::Untyped | CapType::Sched | CapType::Reply
+        ) {
+            return Err(CapError::InsufficientRights); // Untyped/Sched/Reply are never duplicable (see mint)
         }
         if !s.rights.contains(Rights::DERIVE) {
             return Err(CapError::InsufficientRights);
@@ -349,6 +357,43 @@ impl<const N: usize> CSpace<N> {
         Ok(())
     }
 
+    // ---- IPC reply authority (SPEC-CAP §2 CAP-REPLY-1, ADR-0004) ----
+
+    /// Mint a single-use `Reply` capability at `dest`, naming the one blocked caller `caller`
+    /// (an opaque caller-record id the IPC layer assigns) and stamped with the call's endpoint
+    /// `badge`. This is the kernel-only reply-authority path (CAP-REPLY-1): the `Reply` is not
+    /// derived from an `Untyped`, carries no rights (possession *is* the authority to reply
+    /// once), is non-duplicable (COPY/MINT refuse it), and is consumed by [`consume_reply`]. It
+    /// is placed as a derivation root; the IPC layer tears it down on abort/revoke of the call.
+    pub fn mint_reply(&mut self, dest: Cptr, caller: u64, badge: u64) -> Result<(), CapError> {
+        self.place(
+            dest,
+            RawCap {
+                cap_type: CapType::Reply,
+                rights: Rights::empty(),
+                objref: caller, // names exactly the one blocked caller
+                size: 0,
+                watermark: 0,
+                aux: 0,
+                badge,
+            },
+            NIL,
+        )
+    }
+
+    /// Consume the `Reply` at `dest`, returning the caller id it named. This is the single-use
+    /// REPLY (CAP-REPLY-1): it empties the slot, so a *second* reply on the same cptr resolves
+    /// to `EmptySlot` and fails cleanly. Fails `WrongType` if the slot doesn't hold a `Reply`.
+    pub fn consume_reply(&mut self, dest: Cptr) -> Result<u64, CapError> {
+        let r = self.live(dest)?;
+        if r.cap_type != CapType::Reply {
+            return Err(CapError::WrongType);
+        }
+        let caller = r.objref;
+        self.destroy_slot(dest); // single-use: the slot is now empty (a re-reply → EmptySlot)
+        Ok(caller)
+    }
+
     // ---- revocation (SPEC-CAP §7) ----
 
     /// REVOKE: destroy every capability derived from `c` (transitively via the MDB), leaving
@@ -423,12 +468,18 @@ impl<const N: usize> CSpace<N> {
         // Zero the object if this was its last capability (CAP-REVOKE-2 no-residual). Untyped
         // memory is zeroed on the next RETYPE (CAP-MEM-2), so it needs no zeroing here; Sched
         // is pure CPU-time accounting with no backing frames (its `size` is a budget, not a
-        // frame count), so zeroing it would scribble `budget` frames at a bogus address.
+        // frame count); a `Reply` is a kernel record naming a caller (its `objref` is a caller
+        // id, not a frame number) — zeroing any of these would scribble memory at a bogus address.
         let another = (0..N).any(|k| {
             let c = self.slots[k].cap;
             !c.is_null() && c.cap_type as u8 == cap.cap_type as u8 && c.objref == cap.objref
         });
-        if !another && !matches!(cap.cap_type, CapType::Untyped | CapType::Sched) {
+        if !another
+            && !matches!(
+                cap.cap_type,
+                CapType::Untyped | CapType::Sched | CapType::Reply
+            )
+        {
             (self.zero)(cap.objref, cap.size);
         }
     }
@@ -451,6 +502,74 @@ impl<const N: usize> CSpace<N> {
     fn has_children(&self, d: Cptr) -> bool {
         (0..N).any(|k| !self.slots[k].cap.is_null() && self.slots[k].parent == d)
     }
+}
+
+// ---- GRANT over IPC: cross-CSpace capability transfer (SPEC-CAP §5, ADR-0004 DEC-0004-8) ----
+
+/// Whether a [`grant`] hands the capability off (source loses it) or derives a narrowed child.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrantMode {
+    /// Transfer ownership: the source slot is vacated (single-owner handoff).
+    Move,
+    /// Derive a child in the destination; the source keeps its capability.
+    Mint,
+}
+
+/// GRANT a capability over IPC: transfer `src[src_slot]` into `dst[dst_slot]` with `new_rights`
+/// (which MUST be a subset of the source's rights — monotonic, CAP-DERIVE-1) and `badge`.
+/// `Move` vacates the source (single-owner handoff); `Mint` leaves the source and derives a
+/// narrowed child in the destination. **All-or-nothing:** the destination is validated before
+/// the source is touched, so a full destination or a rights violation leaves both CSpaces
+/// unchanged. Atomicity w.r.t. a concurrent REVOKE is the caller's obligation (the kernel runs
+/// this preemption-masked, DEC-0003-7) — within this function no partial state is ever observable.
+///
+/// Refuses to grant a `Reply` (single-use, bound to one caller — never transferable) and to
+/// `Mint`-fork an `Untyped`/`Sched` (their per-cap allocation state can't be duplicated). The
+/// granted capability lands as a derivation root in `dst` (cross-CSpace MDB parenting — a
+/// granter revoking a `Mint`-granted descendant across CSpaces — lands with real processes, P7).
+pub fn grant<const N: usize, const M: usize>(
+    src: &mut CSpace<N>,
+    src_slot: Cptr,
+    dst: &mut CSpace<M>,
+    dst_slot: Cptr,
+    new_rights: Rights,
+    badge: u64,
+    mode: GrantMode,
+) -> Result<(), CapError> {
+    let s = src.live(src_slot)?;
+    if s.cap_type == CapType::Reply {
+        // A Reply names exactly one blocked caller and is single-use — it is never transferable
+        // (CAP-REPLY-1); granting it would be the reply-authority-hoarding leak it prevents.
+        return Err(CapError::InsufficientRights);
+    }
+    if mode == GrantMode::Mint && matches!(s.cap_type, CapType::Untyped | CapType::Sched) {
+        return Err(CapError::InsufficientRights); // a MINT-grant would fork per-cap state
+    }
+    if !s.rights.contains(Rights::GRANT) {
+        return Err(CapError::InsufficientRights); // the cap must be transferable over IPC
+    }
+    if !new_rights.subset_of(s.rights) {
+        return Err(CapError::InsufficientRights); // monotonic: rights can narrow, never widen
+    }
+    if mode == GrantMode::Move && src.has_children(src_slot) {
+        // A MOVE vacates the source slot, but its local MDB children live in the SOURCE CSpace
+        // and cannot follow across CSpaces — vacating would orphan them (dangling parent links,
+        // and a revoke that can no longer reach them: a CAP-REVOKE-1 hazard). Refuse; the granter
+        // must revoke/relocate its derivations first, or use a MINT-grant (which keeps the source).
+        return Err(CapError::InsufficientRights);
+    }
+    let granted = RawCap {
+        rights: new_rights,
+        badge,
+        ..s
+    };
+    // Validate + fill the destination FIRST (all-or-nothing); only then vacate the source.
+    dst.place(dst_slot, granted, NIL)?;
+    if mode == GrantMode::Move {
+        // Vacate WITHOUT zeroing: the object moved to `dst` and is still alive there.
+        src.slots[src_slot] = Cte::EMPTY;
+    }
+    Ok(())
 }
 
 /// Object types RETYPE can produce from `Untyped`. Excludes `Null` (the empty marker),
@@ -805,5 +924,301 @@ mod tests {
         cs.delete(1).unwrap(); // destroy a Sched
         cs.delete(0).unwrap();
         ZEROED.with(|z| assert_eq!(z.get(), 0, "Sched destruction must never zero frames"));
+    }
+
+    // ---- IPC (P4): single-use Reply + cross-CSpace GRANT ----
+
+    #[test]
+    fn reply_is_single_use_and_names_the_caller() {
+        // CAP-REPLY-1 / AC4.2: the first reply consumes the cap; a second fails cleanly.
+        let mut cs = CSpace::<8>::new(nz);
+        cs.mint_reply(1, 0xCA11E7, 0xBADD).unwrap();
+        assert_eq!(cs.resolve(1).unwrap().cap_type, CapType::Reply);
+        assert_eq!(cs.resolve(1).unwrap().badge, 0xBADD);
+        assert_eq!(
+            cs.consume_reply(1),
+            Ok(0xCA11E7),
+            "reply returns the named caller"
+        );
+        // Second reply on the same cptr fails cleanly (slot now empty) — the single-use guarantee.
+        assert_eq!(cs.consume_reply(1), Err(CapError::EmptySlot));
+        assert_eq!(cs.resolve(1), Err(CapError::EmptySlot));
+    }
+
+    #[test]
+    fn reply_is_non_duplicable() {
+        // A Reply must not be COPY/MINT'd (else a server hoards reply authority — the exact leak
+        // CAP-REPLY-1 exists to prevent).
+        let mut cs = CSpace::<8>::new(nz);
+        cs.mint_reply(1, 7, 0).unwrap();
+        assert_eq!(cs.copy(1, 2), Err(CapError::InsufficientRights));
+        assert_eq!(
+            cs.mint(1, 2, Rights::empty(), 0),
+            Err(CapError::InsufficientRights)
+        );
+        assert!(
+            cs.resolve(1).is_ok(),
+            "the reply survives the refused duplication"
+        );
+    }
+
+    #[test]
+    fn reply_consume_zeroes_no_frames() {
+        // The Reply's objref is a caller id, not a frame — consuming it must not call the zero hook.
+        use core::cell::Cell;
+        thread_local!(static Z: Cell<u32> = const { Cell::new(0) });
+        fn rec(_: u64, _: u32) {
+            Z.with(|z| z.set(z.get() + 1));
+        }
+        let mut cs = CSpace::<8>::new(rec);
+        cs.mint_reply(1, 0xFFFF_FFFF, 0).unwrap(); // huge caller id — catastrophic if a frame
+        cs.consume_reply(1).unwrap();
+        Z.with(|z| assert_eq!(z.get(), 0));
+    }
+
+    /// A CSpace with a GRANT-able Frame (retyped from a 64-frame untyped) at slot 1.
+    fn boot_with_frame<const N: usize>() -> CSpace<N> {
+        let mut cs = CSpace::<N>::new(nz);
+        cs.set_root_untyped(0, 64);
+        cs.retype(0, CapType::Frame, 1, 1, 1).unwrap(); // slot 1: RW|MAP|GRANT|DERIVE Frame
+        cs
+    }
+
+    #[test]
+    fn grant_move_transfers_and_narrows_monotonically() {
+        // AC4.5: GRANT moves a cap into the receiver's CSpace with monotonic (narrowed) rights.
+        let mut client = boot_with_frame::<8>();
+        let mut server = CSpace::<8>::new(nz);
+        let objref = client.resolve(1).unwrap().objref;
+        grant(
+            &mut client,
+            1,
+            &mut server,
+            3,
+            Rights::READ,
+            0xC11E,
+            GrantMode::Move,
+        )
+        .unwrap();
+        let g = server.resolve(3).unwrap();
+        assert_eq!(g.cap_type, CapType::Frame);
+        assert_eq!(g.objref, objref, "same object landed in the receiver");
+        assert_eq!(g.rights, Rights::READ, "rights narrowed on transfer");
+        assert_eq!(g.badge, 0xC11E, "badged for the receiver's accounting");
+        assert_eq!(
+            client.resolve(1),
+            Err(CapError::EmptySlot),
+            "MOVE vacated the source"
+        );
+    }
+
+    #[test]
+    fn grant_mint_keeps_source_and_refuses_widening() {
+        let mut client = boot_with_frame::<8>();
+        let mut server = CSpace::<8>::new(nz);
+        grant(
+            &mut client,
+            1,
+            &mut server,
+            3,
+            Rights::READ | Rights::WRITE,
+            0,
+            GrantMode::Mint,
+        )
+        .unwrap();
+        assert!(client.resolve(1).is_ok(), "MINT-grant leaves the source");
+        assert_eq!(
+            server.resolve(3).unwrap().rights,
+            Rights::READ | Rights::WRITE
+        );
+        // Widening beyond the source's rights is refused (monotonic, CAP-DERIVE-1), all-or-nothing.
+        assert_eq!(
+            grant(
+                &mut client,
+                1,
+                &mut server,
+                4,
+                Rights::ALL,
+                0,
+                GrantMode::Move
+            ),
+            Err(CapError::InsufficientRights)
+        );
+        assert!(
+            client.resolve(1).is_ok(),
+            "refused grant left the source untouched"
+        );
+        assert_eq!(
+            server.resolve(4),
+            Err(CapError::EmptySlot),
+            "refused grant placed nothing"
+        );
+    }
+
+    #[test]
+    fn grant_is_all_or_nothing_on_full_destination() {
+        // If the destination slot is occupied, a MOVE-grant must NOT vacate the source — the
+        // all-or-nothing property the in-flight-REVOKE atomicity leans on.
+        let mut client = boot_with_frame::<8>();
+        let mut server = boot_with_frame::<8>(); // server slot 1 occupied
+        assert_eq!(
+            grant(
+                &mut client,
+                1,
+                &mut server,
+                1,
+                Rights::READ,
+                0,
+                GrantMode::Move
+            ),
+            Err(CapError::SlotOccupied)
+        );
+        assert!(
+            client.resolve(1).is_ok(),
+            "occupied-dest grant left the source intact"
+        );
+    }
+
+    #[test]
+    fn grant_refuses_reply_and_ungrantable() {
+        let mut a = CSpace::<8>::new(nz);
+        let mut b = CSpace::<8>::new(nz);
+        // A Reply is never transferable (bound to one caller).
+        a.mint_reply(1, 5, 0).unwrap();
+        assert_eq!(
+            grant(&mut a, 1, &mut b, 2, Rights::empty(), 0, GrantMode::Move),
+            Err(CapError::InsufficientRights)
+        );
+        // A cap without the GRANT right can't be transferred (Untyped has RETYPE only).
+        let mut c = CSpace::<8>::new(nz);
+        c.set_root_untyped(0, 64);
+        assert_eq!(
+            grant(&mut c, 0, &mut b, 2, Rights::RETYPE, 0, GrantMode::Move),
+            Err(CapError::InsufficientRights)
+        );
+        assert!(
+            c.resolve(0).is_ok(),
+            "refused grant left the untyped intact"
+        );
+    }
+
+    #[test]
+    fn grant_then_revoke_source_resolves_cleanly() {
+        // In-flight atomicity shape (CAP-REVOKE-1) at the logic level: after a MOVE-grant, the
+        // source is empty, so a source-side REVOKE finds nothing to reach and the receiver keeps
+        // its cap — whichever order runs, the state is consistent (never a half-transferred cap).
+        let mut client = boot_with_frame::<8>();
+        let mut server = CSpace::<8>::new(nz);
+        grant(
+            &mut client,
+            1,
+            &mut server,
+            2,
+            Rights::READ,
+            0,
+            GrantMode::Move,
+        )
+        .unwrap();
+        // A revoke of the client's (now-empty) source slot fails cleanly, not UB.
+        assert_eq!(client.revoke(1), Err(CapError::EmptySlot));
+        // A revoke of the client's untyped root does NOT reach the moved cap (it left the tree).
+        client.revoke(0).unwrap();
+        assert!(
+            server.resolve(2).is_ok(),
+            "the granted (moved) cap survives a source revoke"
+        );
+    }
+
+    #[test]
+    fn grant_move_refuses_a_cap_with_local_children() {
+        // MOVE-grant of a cap that has MDB children would orphan them (they live in the source
+        // CSpace and can't cross) — refuse it. MINT-grant (source kept) is fine.
+        let mut client = boot_with_frame::<8>(); // slot 1 = Frame (RW|MAP|GRANT|DERIVE)
+        client.mint(1, 2, Rights::READ, 0).unwrap(); // derive a child of the frame at slot 2
+        let mut server = CSpace::<8>::new(nz);
+        assert_eq!(
+            grant(
+                &mut client,
+                1,
+                &mut server,
+                3,
+                Rights::READ,
+                0,
+                GrantMode::Move
+            ),
+            Err(CapError::InsufficientRights)
+        );
+        assert!(
+            client.resolve(1).is_ok(),
+            "refused MOVE left the source + child intact"
+        );
+        assert!(client.resolve(2).is_ok());
+        assert_eq!(
+            server.resolve(3),
+            Err(CapError::EmptySlot),
+            "nothing placed"
+        );
+        // MINT-grant keeps the source, so no orphaning — allowed.
+        grant(
+            &mut client,
+            1,
+            &mut server,
+            3,
+            Rights::READ,
+            0,
+            GrantMode::Mint,
+        )
+        .unwrap();
+        assert!(client.resolve(1).is_ok());
+    }
+
+    #[test]
+    fn revoke_racing_grant_is_atomic_in_both_orderings() {
+        // CAP-REVOKE-1 in-flight atomicity — the explicit race test. On a single CPU the masked
+        // grant and a REVOKE cannot interleave; this asserts that WHICHEVER wins, the state is
+        // consistent (never a half-transferred or duplicated cap).
+        // (1) REVOKE-then-GRANT: the source is gone ⇒ the grant fails cleanly, forging nothing.
+        {
+            let mut client = boot_with_frame::<8>();
+            let mut server = CSpace::<8>::new(nz);
+            client.revoke(0).unwrap(); // revoke the untyped ⇒ destroys the frame at slot 1
+            assert_eq!(client.resolve(1), Err(CapError::EmptySlot));
+            assert_eq!(
+                grant(
+                    &mut client,
+                    1,
+                    &mut server,
+                    2,
+                    Rights::READ,
+                    0,
+                    GrantMode::Move
+                ),
+                Err(CapError::EmptySlot),
+                "grant after revoke finds nothing — no half-transferred cap"
+            );
+            assert_eq!(server.resolve(2), Err(CapError::EmptySlot));
+        }
+        // (2) GRANT-then-REVOKE: the MOVE'd cap left the source tree ⇒ a source revoke can't
+        // reclaim it, and exactly one consistent copy exists (in the receiver).
+        {
+            let mut client = boot_with_frame::<8>();
+            let mut server = CSpace::<8>::new(nz);
+            grant(
+                &mut client,
+                1,
+                &mut server,
+                2,
+                Rights::READ,
+                0,
+                GrantMode::Move,
+            )
+            .unwrap();
+            client.revoke(0).unwrap();
+            assert!(
+                server.resolve(2).is_ok(),
+                "granted cap survives a post-grant source revoke"
+            );
+            assert_eq!(client.resolve(1), Err(CapError::EmptySlot));
+        }
     }
 }

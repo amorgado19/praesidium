@@ -56,6 +56,20 @@ pub fn wait_for_interrupt() {
     };
 }
 
+/// Read the active address-space roots: `[TTBR1_EL1, TTBR0_EL1]` (high-half + low-half). Used by
+/// P4 to assert an IPC fast-path call performs **no address-space swap** (AC4.4) — the SASOS win:
+/// with one address space the roots are invariant across a call, so no TLB flush / TTBR reload.
+#[must_use]
+pub fn read_translation_root() -> [u64; 2] {
+    let (t1, t0): (u64, u64);
+    // SAFETY: reading TTBR1_EL1 / TTBR0_EL1 is side-effect-free.
+    unsafe {
+        asm!("mrs {}, ttbr1_el1", out(reg) t1, options(nomem, nostack, preserves_flags));
+        asm!("mrs {}, ttbr0_el1", out(reg) t0, options(nomem, nostack, preserves_flags));
+    }
+    [t1, t0]
+}
+
 /// ELF entry from Warden (`x0` = the `WardenBootInfo` pointer). Switch to the kernel's
 /// own boot stack (Warden's stack is in allocator-managed RAM), then tail-call
 /// [`crate::kmain`] with `x0` untouched.

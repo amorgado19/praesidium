@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -193,6 +193,19 @@ const PREEMPT_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P3-OK",
 ];
 
+/// P4 (ipc): P3 plus synchronous capability IPC — call/reply, single-use Reply, passive-server
+/// budget, no-AS-swap fast path, and GRANT over IPC (AC4.1–AC4.5).
+const IPC_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P3-OK",
+    "rendezvous is cap-gated", // RI: no ambient authority — Endpoint cap required
+    "call/reply round-trip ok", // AC4.1
+    "GRANT moved Frame",       // AC4.5
+    "second reply on the consumed Reply", // AC4.2 (CAP-REPLY-1)
+    "passive server ran on caller budget", // AC4.3
+    "address-space root unchanged", // AC4.4 (SASOS: no page-table swap)
+    "PRAESIDIUM-P4-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -224,6 +237,12 @@ const SCENARIOS: &[Scenario] = &[
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P3-OK",
     },
+    Scenario {
+        name: "ipc",
+        required: IPC_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P4-OK",
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -254,7 +273,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -271,9 +290,9 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
-    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "preempt".into());
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "ipc".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc)")
     })?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))

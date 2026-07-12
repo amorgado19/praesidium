@@ -21,6 +21,6 @@ pub mod rights;
 pub mod sched;
 
 pub use cap::{Cap, CapType, ObjectType, RawCap};
-pub use cspace::{CSpace, CapError, Cptr};
+pub use cspace::{grant, CSpace, CapError, Cptr, GrantMode};
 pub use rights::Rights;
 pub use sched::Budget;

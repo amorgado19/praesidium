@@ -20,6 +20,7 @@ mod arch;
 mod boot;
 mod cap;
 mod heap;
+mod ipc;
 mod memory;
 mod sched;
 mod sync;
@@ -61,6 +62,9 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
 
     // P3a: executor + capability scheduling (prints PRAESIDIUM-P3A-OK on success).
     sched::run();
+
+    // P4: synchronous capability IPC (prints PRAESIDIUM-P4-OK on success).
+    ipc::run();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

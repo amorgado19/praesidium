@@ -8,6 +8,7 @@ members = [
     "abi",        # syscall ABI + .pex executable format (shared kernel <-> userspace)
     "mem",        # ADR-0002 P1: host-testable buddy/slab/retype allocator logic
     "sched",      # ADR-0003 P3: host-testable async executor + Sched-budget runnability
+    "ipc",        # ADR-0004 P4: host-testable IPC rendezvous + message format + notification
     "kernel",     # the kernel binary (bare-metal ELF, loaded by Warden's rich handoff)
     "xtask",      # host-side build/run/test harness (mirrors Warden's), dual-arch + QEMU
 ]
@@ -20,7 +21,7 @@ members = [
 # `cargo build` at the root builds only the no_std / bare-metal members that make up the
 # kernel image. xtask and tools are HOST tools built explicitly (`cargo run -p xtask ...`),
 # and refproc builds for the userspace side of the ABI, staged separately by xtask.
-default-members = ["cap-core", "abi", "mem", "sched", "kernel"]
+default-members = ["cap-core", "abi", "mem", "sched", "ipc", "kernel"]
 
 [workspace.package]
 edition       = "2021"

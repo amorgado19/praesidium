@@ -23,6 +23,7 @@ cap-core = { path = "../cap-core" }
 abi      = { path = "../abi" }
 mem      = { path = "../mem" }
 sched    = { path = "../sched" }        # P3: async executor + Sched-budget runnability
+ipc      = { path = "../ipc" }          # P4: synchronous capability IPC (endpoint/reply/message)
 log.workspace       = true
 bitflags.workspace  = true
 static_assertions.workspace = true
