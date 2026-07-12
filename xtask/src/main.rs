@@ -209,9 +209,10 @@ const IPC_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P4-OK",
 ];
 
-/// P5a (isolation): P4 plus the SASOS isolation backstop foundation (ADR-0008) — Layer 1
-/// compile-time nameability, Layer 3 guard pages + W^X re-verify + zero, and capability-gated
-/// domain entry (AC5.1/AC5.3, DEC-0008-5). Hardware Layer 2 (MTE) + the escape test are P5b.
+/// P5 (isolation): P4 plus the full SASOS isolation backstop (ADR-0008). P5a — Layer 1 compile-time
+/// nameability, Layer 3 guard pages + W^X + zero, capability-gated domain entry (AC5.1/AC5.3,
+/// DEC-0008-5). P5b — the raw-pointer escape red-team (DEC-0008-7): guard pages actively fault and
+/// a cross-domain raw access is contained on both arches (x86 per-domain page table / aarch64 MTE).
 const ISOLATION_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P4-OK",
     "Cap<T> unforgeable outside cap-core",   // Layer 1 (AC5.1)
@@ -219,6 +220,10 @@ const ISOLATION_REQUIRED: &[&str] = &[
     "W^X re-verified",                       // Layer 3 W^X + zero (AC5.3)
     "domain entry is capability-gated, never ambient", // DEC-0008-5
     "PRAESIDIUM-P5A-OK",
+    // P5b (DEC-0008-7): the raw-pointer escape red-team is CONTAINED on both arches.
+    "guard-page raw read CONTAINED", // Layer 3 guard pages actively fault (recovery seam)
+    "cross-domain raw access CONTAINED", // Layer 2 domain escape held (x86 page-table / aarch64 MTE)
+    "PRAESIDIUM-P5B-OK",
 ];
 
 const SCENARIOS: &[Scenario] = &[
@@ -262,7 +267,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "isolation",
         required: ISOLATION_REQUIRED,
         forbidden: FORBIDDEN,
-        success: "PRAESIDIUM-P5A-OK",
+        success: "PRAESIDIUM-P5B-OK",
     },
 ];
 

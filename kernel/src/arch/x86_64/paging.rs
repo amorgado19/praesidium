@@ -251,11 +251,12 @@ fn invlpg(vaddr: u64) {
 /// half-built table.
 ///
 /// # Safety
-/// `vaddr` must name a page the caller owns and intends to make inaccessible — e.g. the frame
-/// immediately below a freshly-allocated task stack. In a single address space the HHDM alias
-/// is the *only* mapping of that frame, so unmapping a page still used elsewhere would fault
-/// that user. The caller must not later free the underlying frame without first restoring the
-/// mapping (a re-allocated frame would otherwise inherit a non-present HHDM alias).
+/// `vaddr` must name a page the caller owns and intends to make inaccessible *at this virtual
+/// address* — e.g. the HHDM page immediately below a task stack, so a downward overflow faults.
+/// This unmaps only `vaddr`'s mapping; note a sub-4 GiB frame is *also* aliased in the low identity
+/// map, so to make the underlying *frame* unreachable (not just this VA) the caller must unmap every
+/// alias. The caller must not later free the underlying frame without first restoring this mapping
+/// (a re-allocated frame would otherwise inherit a non-present alias).
 pub unsafe fn install_guard_page(vaddr: u64) {
     let v = vaddr & !0xfff; // page-align
     let e4 = read_entry(current_pml4(), idx(v, 3));
@@ -285,4 +286,66 @@ pub unsafe fn install_guard_page(vaddr: u64) {
 
     write_entry(pt, idx(v, 0), 0); // non-present ⇒ the guard
     invlpg(v);
+}
+
+/// Build a **per-domain page table** (isolation Layer 2 fallback, DEC-0008-6): a clone of the
+/// *active* PML4 in which the single 4 KiB page at `victim_vaddr` is unmapped, while EVERYTHING
+/// else — the current code, stack, HHDM, MMIO — stays mapped identically (the lower tables are
+/// shared). Switching CR3 to the returned root keeps executing, but a raw access to `victim_vaddr`
+/// `#PF`s. Only the PML4→PDPT→PD→PT path covering the victim is deep-copied, so the unmap never
+/// perturbs the original (kernel) tables. Returns the clone's PML4 physical address.
+///
+/// x86 has no in-kernel hardware protection-key domain — PKU/PKRU gates *user* pages only and
+/// there is no userspace yet (P7), and this host has no PKS — so this per-domain-page-table
+/// fallback is x86's Layer-2 isolation mechanism, exercised end to end here (AC5.4, honest per
+/// DEC-0008-6). The in-address-space PKU fast path arrives with userspace in P7.
+#[must_use]
+pub fn build_domain_excluding(victim_vaddr: u64) -> u64 {
+    let v = victim_vaddr & !0xfff;
+    let orig_pml4 = current_pml4();
+
+    // Deep-copy one table (all 512 entries) into a fresh frame; return the new frame's phys.
+    let clone_table = |orig: u64| -> u64 {
+        let new = alloc_table();
+        for i in 0..512 {
+            write_entry(new, i, read_entry(orig, i));
+        }
+        new
+    };
+
+    // Clone PML4, then deep-copy down the victim's path so edits stay local to this domain.
+    let new_pml4 = clone_table(orig_pml4);
+
+    let e4 = read_entry(orig_pml4, idx(v, 3));
+    assert!(e4 & PRESENT != 0, "domain: victim PML4 entry absent");
+    let new_pdpt = clone_table(e4 & ADDR_MASK);
+    write_entry(new_pml4, idx(v, 3), new_pdpt | (e4 & !ADDR_MASK));
+
+    let e3 = read_entry(e4 & ADDR_MASK, idx(v, 2));
+    assert!(
+        e3 & PRESENT != 0 && e3 & HUGE == 0,
+        "domain: unexpected 1 GiB victim mapping"
+    );
+    let new_pd = clone_table(e3 & ADDR_MASK);
+    write_entry(new_pdpt, idx(v, 2), new_pd | (e3 & !ADDR_MASK));
+
+    // The victim's PD entry is a 2 MiB huge page (HHDM); split it into a fresh PT (or copy an
+    // already-4 KiB PT), then unmap ONLY the victim page in this domain.
+    let e2 = read_entry(e3 & ADDR_MASK, idx(v, 1));
+    assert!(e2 & PRESENT != 0, "domain: victim PD entry absent");
+    let new_pt = if e2 & HUGE != 0 {
+        let base = e2 & ADDR_MASK & !0x1f_ffff;
+        let flags = e2 & !ADDR_MASK & !HUGE;
+        let pt = alloc_table();
+        for j in 0..512u64 {
+            write_entry(pt, j as usize, (base + j * PAGE) | flags);
+        }
+        pt
+    } else {
+        clone_table(e2 & ADDR_MASK)
+    };
+    write_entry(new_pd, idx(v, 1), new_pt | PRESENT | WRITABLE);
+    write_entry(new_pt, idx(v, 0), 0); // the victim is unmapped in this domain
+
+    new_pml4
 }

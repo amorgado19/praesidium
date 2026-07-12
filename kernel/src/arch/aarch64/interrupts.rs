@@ -10,6 +10,7 @@
 
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::timer;
 use crate::sched::scheduler;
@@ -160,8 +161,9 @@ el1_sync_stub:
     mrs x1, spsr_el1
     stp x30, x0, [sp, #16*15]
     str x1, [sp, #16*16]
+    mov x0, sp               // pass the saved frame so the handler can redirect the saved ELR
     bl {sync_handler}
-    // sync_handler fails closed (never returns), but keep the epilogue for symmetry.
+    b restore_and_eret       // the handler may return (recoverable path); resume via the epilogue
 
 restore_and_eret:
     ldr x1, [sp, #16*16]
@@ -221,9 +223,12 @@ extern "C" fn irq_handler() {
     }
 }
 
-/// Synchronous EL1 exception (a kernel bug: bad access, alignment, undefined instruction …).
-/// Fail closed — loud, then halt.
-extern "C" fn sync_handler() -> ! {
+/// Synchronous EL1 exception. Reached via `el1_sync_stub`, which passes `frame` = the 34-slot
+/// saved integer context (slot 31 = the ELR the epilogue will restore). A fault at exactly the
+/// armed single-shot probe address is the deliberate isolation-escape access (an MTE tag-check
+/// fault) — contain it and resume at the probe's recovery label; any other sync exception is a
+/// real kernel bug and fails closed (loud, then halt).
+extern "C" fn sync_handler(frame: *mut u64) {
     let (esr, elr, far): (u64, u64, u64);
     // SAFETY: reading ESR/ELR/FAR_EL1 is side-effect-free; they describe the fault.
     unsafe {
@@ -232,6 +237,15 @@ extern "C" fn sync_handler() -> ! {
             e = out(reg) esr, l = out(reg) elr, f = out(reg) far,
             options(nomem, nostack, preserves_flags),
         );
+    }
+    if let Some(resume) = expected_fault_resume(far) {
+        kprintln!(
+            "[praesidium] isolation: CONTAINED raw cross-domain access — sync fault at {far:#x} esr={esr:#x} (aarch64)"
+        );
+        // SAFETY: `frame` is the saved integer frame; slot 31 holds the ELR the epilogue restores.
+        // Rewriting it redirects `eret` to the probe's recovery label (a kernel `.text` address).
+        unsafe { frame.add(31).write_volatile(resume) };
+        return; // el1_sync_stub → restore_and_eret → eret to `resume`
     }
     kprintln!("[praesidium] FATAL: EL1 sync exception esr={esr:#x} elr={elr:#x} far={far:#x}");
     crate::arch::halt();
@@ -246,4 +260,75 @@ extern "C" fn unexpected_exception() -> ! {
     };
     kprintln!("[praesidium] FATAL: unexpected aarch64 exception esr={esr:#x}");
     crate::arch::halt();
+}
+
+// ---- single-shot recoverable expected-fault (P5b isolation red-team seam) ----------------
+//
+// The trusted core of the isolation escape test (mirrors the x86 backend). Exactly one deliberate
+// faulting access is armed at a time, at one exact address; `sync_handler` contains ONLY a fault
+// at that address and resumes at a fixed label, disarming immediately. Anything else fails closed.
+// Deliberately NOT a general fixup facility — the smaller the trusted surface, the easier it is to
+// prove a real isolation-escape fault can never be silently recovered.
+
+/// Strips the top-byte pointer tag (MTE logical tag lives in bits [59:56]) so the armed address
+/// and the hardware-reported `FAR_EL1` compare on the address bits alone, tag-agnostic.
+const VA_TAG_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// The armed expected-fault address (tag-stripped), or 0 when disarmed (single-shot).
+static EXPECT_FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
+/// The address to resume at when the armed fault fires (the probe's recovery label).
+static EXPECT_FAULT_RESUME: AtomicU64 = AtomicU64::new(0);
+
+extern "C" {
+    /// Perform a single deliberate byte read of `addr` (in `x0`); returns 1 (via the recovery
+    /// label) if the read faulted and was contained, or 0 if it did not fault.
+    fn praesidium_a64_probe_read(addr: u64) -> u64;
+    /// The recovery label inside `praesidium_a64_probe_read`; the handler resumes here.
+    static praesidium_a64_probe_resume: u8;
+}
+
+global_asm!(
+    r#"
+.section .text
+.global praesidium_a64_probe_read
+.global praesidium_a64_probe_resume
+praesidium_a64_probe_read:
+    ldrb w1, [x0]        // the deliberate access — faults on a tag mismatch or unmapped page
+    mov x0, #0           // no fault: return 0 (containment FAILED — the access succeeded)
+    ret
+praesidium_a64_probe_resume:
+    mov x0, #1           // handler vectored us here after CONTAINED: return 1
+    ret
+"#
+);
+
+/// If a fault at `far` is the armed single-shot probe (compared tag-agnostically), disarm and
+/// return its resume label; otherwise `None` (the caller fails closed). Only the sync handler
+/// calls this.
+fn expected_fault_resume(far: u64) -> Option<u64> {
+    let expect = EXPECT_FAULT_ADDR.load(Ordering::Relaxed);
+    if expect != 0 && (far & VA_TAG_MASK) == expect {
+        EXPECT_FAULT_ADDR.store(0, Ordering::Relaxed); // single-shot: disarm before resuming
+        return Some(EXPECT_FAULT_RESUME.load(Ordering::Relaxed));
+    }
+    None
+}
+
+/// Attempt a raw byte read of `addr` that is **expected to fault** (an isolation-escape probe),
+/// containing the fault. Returns `true` iff the access faulted and was contained; `false` means
+/// the access *succeeded* — isolation did NOT hold. `addr` may carry an MTE tag in its top byte.
+///
+/// Arms the single-shot continuation, performs the access, and disarms unconditionally.
+pub fn contains_raw_read(addr: u64) -> bool {
+    EXPECT_FAULT_RESUME.store(
+        core::ptr::addr_of!(praesidium_a64_probe_resume) as u64,
+        Ordering::Relaxed,
+    );
+    EXPECT_FAULT_ADDR.store(addr & VA_TAG_MASK, Ordering::Relaxed); // arm last (tag-stripped)
+                                                                    // SAFETY: `praesidium_a64_probe_read` does a single byte read of `addr`. We expect it to fault
+                                                                    // (tag mismatch / unmapped); the armed handler resumes at the recovery label returning 1. If
+                                                                    // `addr` is in fact accessible, no fault occurs and it returns 0 — reported as "not contained".
+    let contained = unsafe { praesidium_a64_probe_read(addr) } == 1;
+    EXPECT_FAULT_ADDR.store(0, Ordering::Relaxed); // ensure disarmed on the no-fault path
+    contained
 }

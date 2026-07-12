@@ -30,6 +30,7 @@ const AF: u64 = 1 << 10; // access flag (or the access faults)
 const SH_INNER: u64 = 0b11 << 8; // inner shareable
 const ATTR_NORMAL: u64 = 0 << 2; // AttrIndx 0 → MAIR attr0 (Normal WB)
 const ATTR_DEVICE: u64 = 1 << 2; // AttrIndx 1 → MAIR attr1 (Device nGnRnE)
+const ATTR_TAGGED: u64 = 2 << 2; // AttrIndx 2 → MAIR attr2 (Normal WB Tagged / MTE, P5b)
 const AP_RO: u64 = 1 << 7; // read-only at EL1 (clear = read-write)
 const PXN: u64 = 1 << 53; // privileged execute-never (clear = EL1-executable)
 const UXN: u64 = 1 << 54; // unprivileged execute-never (kernel pages: always set)
@@ -228,26 +229,57 @@ pub fn page_prot(vaddr: u64) -> Option<(bool, bool)> {
 /// guard VA evicts any stale block/page TLB entry — the DEC-0007-4 arch-seam obligation.
 ///
 /// # Safety
-/// `vaddr` must name a page the caller owns and intends to make inaccessible — e.g. the frame
-/// immediately below a freshly-allocated task stack. In a single address space the HHDM alias
-/// is the *only* mapping of that frame, so unmapping a page still used elsewhere would fault
-/// that user. The caller must not free the underlying frame without first restoring the mapping.
+/// `vaddr` must name a page the caller owns and intends to make inaccessible *at this virtual
+/// address* — e.g. the HHDM page immediately below a task stack, so a downward overflow faults.
+/// This unmaps only `vaddr`'s mapping; note a sub-4 GiB frame is *also* aliased in the low identity
+/// map (TTBR0), so making the underlying *frame* unreachable requires unmapping every alias. The
+/// caller must not free the underlying frame without first restoring this mapping.
 pub unsafe fn install_guard_page(vaddr: u64) {
     let v = vaddr & !0xfff; // page-align
+    let l3 = ensure_l3_table(v);
+    write_entry(l3, lidx(v, 3), 0); // invalid descriptor ⇒ the guard
+    flush_page(v);
+}
+
+/// Remap the 4 KiB page at `vaddr` as **Normal-Tagged** (MTE, `AttrIndx = 2`) — read-write,
+/// non-executable, inner-shareable — splitting the covering 2 MiB block first if needed. The
+/// physical backing is unchanged; only the memory *type* becomes Tagged, so MTE tag checks now
+/// apply to every access of the page (the P5b aarch64 Layer-2 domain victim). The Tagged MAIR
+/// attribute must already be installed at index 2 (see [`super::mte::enable`]).
+///
+/// # Safety
+/// `vaddr` must be an HHDM page the caller owns. Once it is Tagged, every access is tag-checked,
+/// so the caller MUST set an allocation tag (STG) matching the pointers it will use before access.
+pub unsafe fn map_tagged(vaddr: u64) {
+    let v = vaddr & !0xfff;
+    let l3 = ensure_l3_table(v);
+    let pa = read_entry(l3, lidx(v, 3)) & ADDR_MASK; // keep the page's current physical backing
+    write_entry(
+        l3,
+        lidx(v, 3),
+        pa | AF | SH_INNER | ATTR_TAGGED | TABLE | UXN | PXN,
+    );
+    flush_page(v);
+}
+
+/// Walk to `v`'s L2 entry and, if it is a 2 MiB block, split it into a fresh 512-entry L3 table
+/// with identical attributes; returns the L3 table's physical address. The table is published
+/// with `dsb ishst` before the L2 descriptor is swung to point at it (a single aligned store), so
+/// the walker never observes a half-built table — the split preserves every other translation in
+/// the window. Shared by [`install_guard_page`] and [`map_tagged`]. `v` must be page-aligned.
+fn ensure_l3_table(v: u64) -> u64 {
     let root = current_root(v);
     let e0 = read_entry(root, lidx(v, 0));
-    assert!(e0 & VALID != 0, "guard page: L0 entry absent");
+    assert!(e0 & VALID != 0, "split: L0 entry absent");
     let e1 = read_entry(e0 & ADDR_MASK, lidx(v, 1));
     assert!(
         e1 & VALID != 0 && e1 & 0b11 == TABLE,
-        "guard page: unexpected L1 block"
+        "split: unexpected L1 block"
     );
     let l2 = e1 & ADDR_MASK;
     let e2 = read_entry(l2, lidx(v, 2));
-    assert!(e2 & VALID != 0, "guard page: L2 entry absent");
-
-    let l3 = if e2 & 0b11 == BLOCK {
-        // Split the 2 MiB block into 512 × 4 KiB L3 pages with identical attributes.
+    assert!(e2 & VALID != 0, "split: L2 entry absent");
+    if e2 & 0b11 == BLOCK {
         let base = e2 & ADDR_MASK & !0x1f_ffff; // 2 MiB-aligned output base
         let attrs = e2 & !ADDR_MASK & !0b11; // AF|SH|AttrIndx|AP|PXN|UXN (drop the descriptor bits)
         let new_l3 = alloc_table();
@@ -261,11 +293,13 @@ pub unsafe fn install_guard_page(vaddr: u64) {
         new_l3
     } else {
         e2 & ADDR_MASK
-    };
+    }
+}
 
-    write_entry(l3, lidx(v, 3), 0); // invalid descriptor ⇒ the guard
-                                    // SAFETY: order the guard store, invalidate the VA's last-level TLB entry (block or page),
-                                    // then re-synchronise instruction/translation state — the explicit arch-seam sequence.
+/// Invalidate the last-level TLB entry (block or page) for page-aligned `v` and re-synchronise —
+/// the explicit arch-seam sequence after a leaf edit (DEC-0007-4).
+fn flush_page(v: u64) {
+    // SAFETY: order prior table stores, invalidate the VA's last-level entry, then re-sync.
     unsafe {
         asm!(
             "dsb ishst",

@@ -132,6 +132,51 @@ fn verify_wx_and_zero() {
     );
 }
 
+/// P5b entry: the SASOS isolation escape red-team (ADR-0008 DEC-0008-7), the RED-TEAM GATE. Proves
+/// the isolation mechanisms are **ARMED** — a deliberate raw access into a region the accessor
+/// holds no capability for is CONTAINED (faults through the hardware mechanism, then recovers via
+/// the single-shot seam), not silently allowed. This is *armed*-proof (the fault path is live end
+/// to end), distinct from evasion-resistance against a hostile *native binary* (AC7.3/P7) — do not
+/// conflate them. Layer 3 (guard pages actively fault) + Layer 2 (arch domain: x86 per-domain page
+/// table / aarch64 MTE). Emits `PRAESIDIUM-P5B-OK`. See [`run`] for the P5a foundation.
+pub fn run_escape_tests() {
+    kprintln!("[praesidium] isolation: P5b — raw-pointer escape red-team (ADR-0008 DEC-0008-7)");
+    escape_guard_page();
+    escape_domain();
+    kprintln!("[praesidium] PRAESIDIUM-P5B-OK");
+}
+
+/// Layer 2 escape (ISO-AC4, the RED-TEAM GATE): stand up a protection domain, attempt a raw
+/// cross-domain access into a region the domain holds no capability for, and require it to be
+/// CONTAINED. The arch backend selects the mechanism (x86 = per-domain page-table fallback,
+/// DEC-0008-6; aarch64 = MTE tag-check, DEC-0008-3) and logs which one held — the honest
+/// documentation AC5.4 demands. A raw access that *succeeds* here is an isolation breach: FATAL.
+fn escape_domain() {
+    if !arch::domain_escape_contained() {
+        fatal("a raw cross-domain access SUCCEEDED — isolation breach (CAP-MEM-3 hole)");
+    }
+    kprintln!(
+        "[praesidium] isolation: cross-domain raw access CONTAINED — Layer 2 held (AC5.2/AC5.4)"
+    );
+}
+
+/// Layer 3 escape: a raw read of a guard page must FAULT and be **contained** — a stronger claim
+/// than P5a's "the page is unmapped". Proves the recovery seam and that a guard actively traps a
+/// linear overrun on both arches.
+fn escape_guard_page() {
+    let block = memory::alloc_frames(1).unwrap_or_else(|| fatal("no frames for guard escape"));
+    let guard = memory::phys_to_virt(block);
+    // SAFETY: `block` is the lower frame of our own freshly-allocated block; nothing else aliases
+    // it, so unmapping its sole (HHDM) mapping is sound.
+    unsafe { arch::install_guard_page(guard) };
+    if !arch::contains_raw_read(guard) {
+        fatal("a raw read of a guard page was NOT contained (the guard did not fault)");
+    }
+    kprintln!(
+        "[praesidium] isolation: guard-page raw read CONTAINED — Layer 3 actively faults (AC5.4)"
+    );
+}
+
 /// DEC-0008-5: domain entry is capability-gated, never ambient. Holding the `Domain` cap (ENTER)
 /// authorizes entering exactly its domain; broad-but-wrong authority (an `Untyped`) and an empty
 /// slot are both refused. Proves there is no ambient "switch to domain X".

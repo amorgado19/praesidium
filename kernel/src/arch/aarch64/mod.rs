@@ -10,10 +10,12 @@ use core::ptr::{read_volatile, write_volatile};
 
 mod context;
 mod interrupts;
+mod mte;
 mod paging;
 mod timer;
 pub use context::{context_init, context_switch, Context};
-pub use interrupts::interrupts_init;
+pub use interrupts::{contains_raw_read, interrupts_init};
+pub use mte::domain_escape_contained;
 pub use paging::{
     activate_address_space, build_address_space, enable_wx, install_guard_page, page_prot,
     translate,

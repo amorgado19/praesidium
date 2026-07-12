@@ -11,10 +11,10 @@ mod interrupts;
 mod paging;
 mod timer;
 pub use context::{context_init, context_switch, Context};
-pub use interrupts::interrupts_init;
+pub use interrupts::{contains_raw_read, interrupts_init};
 pub use paging::{
-    activate_address_space, build_address_space, enable_wx, install_guard_page, page_prot,
-    translate,
+    activate_address_space, build_address_space, build_domain_excluding, enable_wx,
+    install_guard_page, page_prot, translate,
 };
 pub use timer::timer_init;
 
@@ -61,6 +61,71 @@ pub fn read_translation_root() -> [u64; 2] {
     // SAFETY: reading CR3 is side-effect-free.
     unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
     [cr3, 0]
+}
+
+/// Isolation Layer-2 escape red-team (P5b, DEC-0008-7): stand up an "attacker domain" in which a
+/// victim **frame** is unreachable, switch into it, attempt raw reads of the frame, and report
+/// whether the hardware contained them (`#PF`). Returns `true` iff *every* alias faulted (isolation
+/// held); `false` if any raw read *succeeded* (a breach). Runs with preemption masked so no task is
+/// scheduled on the transient domain CR3.
+///
+/// **Alias-honest.** This SASOS double-maps every allocatable frame (< 4 GiB): a low identity alias
+/// (`phys`) *and* an HHDM alias (`phys + hhdm_offset`). Isolating a *frame* therefore means making
+/// *both* inaccessible — unmapping only the HHDM alias would leave the secret trivially readable via
+/// the identity alias (a false "contained"). So the identity alias is unmapped globally (the kernel
+/// reaches heap frames only through the HHDM) and the domain additionally excludes the HHDM alias;
+/// then *both* aliases are probed and both must fault.
+///
+/// x86's Layer-2 mechanism is the per-domain-page-table fallback (DEC-0008-6) — see
+/// [`build_domain_excluding`]. The deliberate faults are contained by the single-shot recovery seam.
+pub fn domain_escape_contained() -> bool {
+    use crate::arch::AddressSpace;
+    /// A recognizable value written through the kernel's HHDM mapping, confirmed intact afterwards.
+    const SENTINEL: u64 = 0x5A5A_1508_D0D0_BEEF;
+
+    let phys = crate::memory::alloc_frames(0).expect("no frame for the domain-escape victim");
+    let hhdm = crate::memory::phys_to_virt(phys); // the HHDM alias (high half)
+    let ident = phys; // the low-half identity alias — the second mapping SASOS gives every frame
+                      // SAFETY: `hhdm` is a freshly-allocated, HHDM-mapped, writable frame the kernel owns.
+    unsafe { (hhdm as *mut u64).write_volatile(SENTINEL) };
+
+    // SAFETY: `ident` is this frame's identity alias; the kernel never reaches heap frames through
+    // the identity map, so unmapping it globally is sound and leaves the HHDM alias (which the
+    // kernel uses) untouched.
+    unsafe { install_guard_page(ident) };
+
+    let original = read_translation_root()[0];
+    let domain = build_domain_excluding(hhdm);
+
+    let prev = preempt_disable(); // no task may run on the transient domain CR3
+                                  // SAFETY: `domain` clones the active PML4 (identity alias already unmapped) and additionally
+                                  // unmaps the HHDM alias; everything else — RIP, stack, MMIO — is identical, so the CR3 load
+                                  // keeps executing here.
+    unsafe {
+        activate_address_space(AddressSpace {
+            primary: domain,
+            secondary: 0,
+        })
+    };
+    kprintln!("[praesidium] isolation: entered attacker domain — x86 per-domain page table (DEC-0008-6); BOTH victim aliases (HHDM + identity) unmapped here");
+    let c_hhdm = contains_raw_read(hhdm);
+    let c_ident = contains_raw_read(ident);
+    // SAFETY: restore the kernel's real address space (its original CR3) before re-enabling preemption.
+    unsafe {
+        activate_address_space(AddressSpace {
+            primary: original,
+            secondary: 0,
+        })
+    };
+    preempt_restore(prev);
+
+    // SAFETY: back in the kernel domain, the HHDM alias is mapped again; confirm the sentinel survived.
+    let survived = unsafe { (hhdm as *const u64).read_volatile() } == SENTINEL;
+    if !survived {
+        kprintln!("[praesidium] FATAL: isolation: victim data did not survive the domain crossing");
+        crate::arch::halt();
+    }
+    c_hhdm && c_ident
 }
 
 /// ELF entry from Warden (`rdi` = the `WardenBootInfo` pointer). We switch to the
