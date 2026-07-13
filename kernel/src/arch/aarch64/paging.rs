@@ -31,9 +31,10 @@ const SH_INNER: u64 = 0b11 << 8; // inner shareable
 const ATTR_NORMAL: u64 = 0 << 2; // AttrIndx 0 → MAIR attr0 (Normal WB)
 const ATTR_DEVICE: u64 = 1 << 2; // AttrIndx 1 → MAIR attr1 (Device nGnRnE)
 const ATTR_TAGGED: u64 = 2 << 2; // AttrIndx 2 → MAIR attr2 (Normal WB Tagged / MTE, P5b)
-const AP_RO: u64 = 1 << 7; // read-only at EL1 (clear = read-write)
+const AP_RO: u64 = 1 << 7; // AP[2]: read-only (clear = read-write)
+const AP_EL0: u64 = 1 << 6; // AP[1]: accessible at EL0 (clear = EL1-only) — user pages set this
 const PXN: u64 = 1 << 53; // privileged execute-never (clear = EL1-executable)
-const UXN: u64 = 1 << 54; // unprivileged execute-never (kernel pages: always set)
+const UXN: u64 = 1 << 54; // unprivileged (EL0) execute-never (kernel pages: always set)
 
 /// Table index for `vaddr` at translation `level` (0 = L0 … 3 = L3).
 fn lidx(vaddr: u64, level: u32) -> usize {
@@ -324,6 +325,34 @@ pub unsafe fn map_page(vaddr: u64, phys: u64, prot: Prot) {
     let v = vaddr & !0xfff;
     let l3 = ensure_l3_table(v);
     write_entry(l3, lidx(v, 3), page_desc(phys & ADDR_MASK, prot));
+    flush_page(v);
+}
+
+/// Descriptor for a 4 KiB **user (EL0-accessible)** page, per protection. Sets `AP[1]` (EL0
+/// access); a `Prot::Rx` code page clears `UXN` (EL0-executable) but always sets `PXN` — the
+/// kernel must never execute userspace code (a defence against a bug jumping into user code at
+/// EL1). W^X holds: `Prot` has no writable-and-executable variant.
+fn user_page_desc(pa: u64, prot: Prot) -> u64 {
+    let base = pa | AF | SH_INNER | ATTR_NORMAL | TABLE | AP_EL0 | PXN; // EL0-accessible, EL1-noexec
+    match prot {
+        Prot::Rx => base | AP_RO,       // read-only + EL0-executable (UXN clear)
+        Prot::Ro => base | AP_RO | UXN, // read-only + non-executable
+        Prot::Rw => base | UXN,         // read-write (AP[2] clear) + non-executable
+    }
+}
+
+/// Map the 4 KiB page at `vaddr` to physical `phys` as an **EL0-accessible** page with protection
+/// `prot` (splitting the covering 2 MiB block first if needed). Used by the P7 loader to place a
+/// userspace process's `.pex` segments so the process can reach them at EL0, while everything else
+/// (HHDM, kernel) stays supervisor-only — so an EL0 raw pointer into kernel memory faults.
+///
+/// # Safety
+/// `vaddr` must be a page in the process's reserved VA window the caller controls; `phys` a frame
+/// the caller owns. Overwrites any existing mapping of `vaddr`.
+pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot) {
+    let v = vaddr & !0xfff;
+    let l3 = ensure_l3_table(v);
+    write_entry(l3, lidx(v, 3), user_page_desc(phys & ADDR_MASK, prot));
     flush_page(v);
 }
 

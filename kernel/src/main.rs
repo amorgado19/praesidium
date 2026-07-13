@@ -27,6 +27,7 @@ mod memory;
 mod sched;
 mod sync;
 mod syscall;
+mod user;
 
 use boot::handoff::WardenBootInfo;
 
@@ -77,6 +78,9 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
 
     // P6: capability-invocation ABI + `.pex` loader (prints PRAESIDIUM-P6-OK on success).
     loader::run();
+
+    // P7a: EL0 userspace transport — drop to EL0, run native code, service its syscall trap.
+    user::run();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

@@ -18,6 +18,20 @@
 /// path (ADR-0004). A register-only payload keeps the boundary hot and nothing to bulk-validate.
 pub const MSG_REGS: usize = 4;
 
+/// Syscall selectors, carried in the syscall-number register at the trap boundary (aarch64 `x8` /
+/// x86-64 `rax`) — the kernel's EL0/ring-3 trap dispatches on this. `INVOKE` carries an
+/// [`Invocation`] in the remaining argument registers; `DEBUG`/`EXIT` are the minimal process
+/// lifecycle a reference process needs. This is the arch-generic contract; the concrete register
+/// assignment is arch-specific (behind the ADR-0007 seam).
+pub mod sys {
+    /// Perform a capability invocation (the argument registers carry the [`super::Invocation`]).
+    pub const INVOKE: u64 = 0;
+    /// Bring-up: log the value in the first argument register over the kernel's serial console.
+    pub const DEBUG: u64 = 1;
+    /// Terminate the calling process (the first argument register is the exit code).
+    pub const EXIT: u64 = 2;
+}
+
 /// Operation selectors. Stable wire values (they cross the user/kernel boundary). Kept tiny in
 /// P6 — enough to prove cptr resolution + rights-checked dispatch + the IPC unification.
 pub mod op {

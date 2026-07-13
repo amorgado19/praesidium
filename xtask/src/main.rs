@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -240,6 +240,26 @@ const LOADER_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P6-OK",
 ];
 
+/// P7a (user): P6 plus the EL0 userspace transport — drop to EL0, run native code, service its
+/// syscall trap (aarch64; x86-64 ring 3 is a follow-on). Bring-up validation gate.
+const USER_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P6-OK",
+    "EL0 userspace transport",  // entered P7a
+    "EL0 syscall DEBUG value=0xbeef", // the process ran real EL0 code + trapped a syscall
+    "process exited (code 0)",  // clean exit via syscall
+    "PRAESIDIUM-P7A-OK",
+];
+
+/// P7a (user) on x86-64: ring 3 is a follow-on (the aarch64 EL0 path is validated first), so
+/// `user::run()` cleanly reports the skip. The scenario still proves the kernel reached P7a and
+/// halted cleanly — it just does not assert an EL0 round-trip. Retired once x86 ring 3 lands and
+/// x86 emits the full `PRAESIDIUM-P7A-OK` markers like aarch64.
+const USER_REQUIRED_X86: &[&str] = &[
+    "PRAESIDIUM-P6-OK",
+    "EL0 userspace transport", // reached P7a bring-up
+    "PRAESIDIUM-P7A-SKIP",     // cleanly skipped (ring 3 pending) — NOT an EL0 run
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -289,6 +309,12 @@ const SCENARIOS: &[Scenario] = &[
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P6-OK",
     },
+    Scenario {
+        name: "user",
+        required: USER_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P7A-OK",
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -319,7 +345,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -338,8 +364,15 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let use_tpm = !flag(args, "--no-tpm");
     let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "loader".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user)")
     })?;
+    // Arch-gate: a scenario whose x86-64 path is a follow-on (here, P7a's ring 3) asserts a
+    // reduced, arch-appropriate marker set on x86 so `smoke --arch x86_64` reflects reality instead
+    // of failing by construction. aarch64 (and every other scenario) uses the full required/success.
+    let (required, success): (&[&str], &str) = match (arch.name, sc.name) {
+        ("x86_64", "user") => (USER_REQUIRED_X86, "PRAESIDIUM-P7A-SKIP"),
+        _ => (sc.required, sc.success),
+    };
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))
         .transpose()?
@@ -370,7 +403,8 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
         &vars,
         tpm_sock.as_deref(),
         timeout,
-        sc,
+        sc.forbidden,
+        success,
     );
 
     if let Some((mut child, _)) = tpm {
@@ -386,7 +420,7 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     print!("{log}");
     println!("\n----- end serial ({}) -----", arch.name);
 
-    let markers_ok = assert_markers(&log, sc.required, sc.forbidden);
+    let markers_ok = assert_markers(&log, required, sc.forbidden);
     // Positive clean-halt check: a passing P0 kernel parks in hlt/wfi, so QEMU must
     // still have been running when the watchdog killed it. An early self-exit
     // (reset / triple-fault under -no-reboot) is a failure even if markers appear.
@@ -611,7 +645,8 @@ fn run_qemu(
     vars: &Path,
     tpm_sock: Option<&Path>,
     timeout: u64,
-    sc: &Scenario,
+    fb: &[&str],
+    success_marker: &str,
 ) -> Result<(String, bool), String> {
     let mut args: Vec<String> = Vec::new();
     for m in arch.machine {
@@ -681,8 +716,8 @@ fn run_qemu(
         }
     });
 
-    let forbidden: Vec<&[u8]> = sc.forbidden.iter().map(|s| s.as_bytes()).collect();
-    let success = sc.success.as_bytes();
+    let forbidden: Vec<&[u8]> = fb.iter().map(|s| s.as_bytes()).collect();
+    let success = success_marker.as_bytes();
     // Once the success marker lands, keep draining for a short grace window so a
     // forbidden marker emitted right *after* it is still caught (defeats a
     // "print OK then fault" mask). Forbidden is checked first each iteration, so if

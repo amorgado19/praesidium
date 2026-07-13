@@ -192,6 +192,16 @@ pub extern "C" fn task_enter() -> ! {
     task_exit();
 }
 
+/// Retire the CURRENT task from outside the normal body-return path — e.g. a userspace process
+/// exiting via a syscall or being killed on a fault, called from the EL0 trap handler running on
+/// that task's kernel stack. Marks it finished and schedules away for good (its kernel stack, and
+/// the abandoned handler frame on it, are discarded — the task never resumes).
+// Called by the arch EL0 trap handler — live on aarch64 in P7a; wired on x86-64 once ring 3 lands.
+#[allow(dead_code)]
+pub fn exit_current() -> ! {
+    task_exit();
+}
+
 /// Retire the current task: mark it finished and hand the CPU away for good. Never returns.
 fn task_exit() -> ! {
     let _ = arch::preempt_disable();

@@ -310,6 +310,24 @@ pub unsafe fn map_page(vaddr: u64, phys: u64, prot: Prot) {
     invlpg(v);
 }
 
+/// Page-table entry bit granting ring-3 (user) access to a page (U/S).
+const USER: u64 = 1 << 2;
+
+/// Map the 4 KiB page at `vaddr` to physical `phys` as a **ring-3 (user) accessible** page with
+/// protection `prot` (W^X via [`leaf_bits`]), splitting the covering 2 MiB page first if needed.
+/// Used by the P7 loader to place a userspace process's segments so ring 3 can reach them, while
+/// the kernel/HHDM stay supervisor-only (a ring-3 raw pointer into kernel memory faults).
+///
+/// # Safety
+/// `vaddr` must be a page in the process's reserved VA window the caller controls; `phys` a frame
+/// the caller owns. Overwrites any existing mapping of `vaddr`.
+pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot) {
+    let v = vaddr & !0xfff;
+    let pt = ensure_pt(v);
+    write_entry(pt, idx(v, 0), (phys & ADDR_MASK) | leaf_bits(prot) | USER);
+    invlpg(v);
+}
+
 /// Make `len` bytes at `vaddr` coherent for instruction fetch after the loader has written code
 /// there through the data path (ADR-0006 / GC-09 — the cache-maintenance seam owed since P0, now
 /// that P6 first copies-then-executes code).
