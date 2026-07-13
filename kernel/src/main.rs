@@ -22,9 +22,11 @@ mod cap;
 mod heap;
 mod ipc;
 mod isolation;
+mod loader;
 mod memory;
 mod sched;
 mod sync;
+mod syscall;
 
 use boot::handoff::WardenBootInfo;
 
@@ -70,8 +72,11 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     // P5a: SASOS isolation backstop foundation (prints PRAESIDIUM-P5A-OK on success).
     isolation::run();
 
-    // P5b (WIP): raw-pointer escape red-team — mechanisms are ARMED and contain a raw access.
+    // P5b: raw-pointer escape red-team — mechanisms are ARMED and contain a raw access.
     isolation::run_escape_tests();
+
+    // P6: capability-invocation ABI + `.pex` loader (prints PRAESIDIUM-P6-OK on success).
+    loader::run();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

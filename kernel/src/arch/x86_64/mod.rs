@@ -14,9 +14,14 @@ pub use context::{context_init, context_switch, Context};
 pub use interrupts::{contains_raw_read, interrupts_init};
 pub use paging::{
     activate_address_space, build_address_space, build_domain_excluding, enable_wx,
-    install_guard_page, page_prot, translate,
+    install_guard_page, map_page, page_prot, sync_instruction_cache, translate,
 };
 pub use timer::timer_init;
+
+/// The `.pex` architecture tag for this backend (ADR-0006): a `.pex`'s segments are native code,
+/// so the loader only accepts images tagged for the arch it runs on. Behind the seam so nothing
+/// above it needs `#[cfg(target_arch)]`.
+pub const PEX_ARCH: u16 = abi::pex::ARCH_X86_64;
 
 /// Mask maskable interrupts (disable preemption), returning whether they were enabled before —
 /// pass that back to [`preempt_restore`] to nest correctly.

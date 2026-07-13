@@ -4,10 +4,17 @@
 //! executable format (including the capability manifest) — the stable seam both
 //! the kernel and userspace build against.
 //!
-//! **In P0 it is deliberately empty.** No syscalls or executable format exist
-//! until P6. Kept `#![no_std]` so both sides can depend on it.
+//! Two surfaces (P6): the **invocation syscall ABI** ([`invoke`]) — how userspace invokes the
+//! kernel, carrying cptrs + rights rather than raw addresses — and the **`.pex` executable
+//! format** ([`pex`], [`encode`]) — how a process is packaged and how its *initial* capabilities
+//! are declared (the capability manifest). Both are pure wire contracts: this crate has no
+//! `cap-core` dependency, so the manifest carries raw wire ints that the kernel validates and
+//! maps to real capability types (treating every `.pex` as hostile input, GC-03).
 //!
-//! Note: this is *Praesidium's own* ABI. It is distinct from the frozen
-//! `warden-abi` handoff contract, which the kernel vendors separately in
-//! `kernel/src/boot/handoff.rs`.
+//! Note: this is *Praesidium's own* ABI. It is distinct from the frozen `warden-abi` handoff
+//! contract, which the kernel vendors separately in `kernel/src/boot/handoff.rs`.
 #![no_std]
+
+pub mod encode;
+pub mod invoke;
+pub mod pex;

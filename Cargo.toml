@@ -11,6 +11,7 @@ members = [
     "ipc",        # ADR-0004 P4: host-testable IPC rendezvous + message format + notification
     "kernel",     # the kernel binary (bare-metal ELF, loaded by Warden's rich handoff)
     "xtask",      # host-side build/run/test harness (mirrors Warden's), dual-arch + QEMU
+    "tools",      # P6: host-side .pex producer (mkpex) — rejoined now that its sources exist
 ]
 # `refproc` (P7 userspace processes) and `tools` (P6 .pex toolchain) declare [[bin]]
 # targets whose sources don't exist yet, so they are NOT workspace members during P0 —

@@ -97,8 +97,12 @@ impl<const N: usize> CSpace<N> {
     /// Install a primordial `Sched` capability (CPU-time `budget` per `period`) at `slot` —
     /// the kernel's initial CPU-time authority (SPEC-CAP §6) and the root of the `Sched`
     /// derivation tree. Like [`set_root_untyped`](Self::set_root_untyped), a trusted boot-path
-    /// bootstrap; `slot` must be a valid, empty slot. `DERIVE` authorizes SPLIT/DELEGATE; a
-    /// `Sched` is never COPY/MINT-able (its per-cap budget would fork — see [`mint`](Self::mint)).
+    /// bootstrap; `slot` must be a valid, empty slot. This is **primordial** CPU-time authority, so
+    /// it carries `DERIVE` (authorizes SPLIT/DELEGATE) **and** `GRANT` (authorizes handing a
+    /// sub-allotment to another CSpace — e.g. the P6 loader granting a process its budget). A
+    /// `Sched` is still never COPY/MINT-able (its per-cap budget would fork — see [`mint`](Self::mint));
+    /// `GRANT` only enables a **Move**-grant (a transfer, not a duplication), which `grant` permits
+    /// for `Sched` while refusing a Mint-grant.
     pub fn set_root_sched(&mut self, slot: Cptr, budget: u32, period: u32) {
         debug_assert!(slot < N, "set_root_sched: slot out of bounds");
         let objref = self.next_obj;
@@ -106,7 +110,7 @@ impl<const N: usize> CSpace<N> {
         self.slots[slot] = Cte {
             cap: RawCap {
                 cap_type: CapType::Sched,
-                rights: Rights::DERIVE,
+                rights: Rights::DERIVE | Rights::GRANT,
                 objref,
                 size: budget,
                 watermark: 0, // consumed this period

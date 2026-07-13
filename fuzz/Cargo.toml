@@ -16,10 +16,19 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 ipc = { path = "../ipc" }
+abi = { path = "../abi" }
 
 [[bin]]
 name = "ipc_message"
 path = "fuzz_targets/ipc_message.rs"
+test = false
+doc = false
+bench = false
+
+# P6: the .pex loader parses HOSTILE on-disk binaries (ADR-0006 R2 / GC-03) — fuzz the decoder.
+[[bin]]
+name = "pex_parse"
+path = "fuzz_targets/pex_parse.rs"
 test = false
 doc = false
 bench = false

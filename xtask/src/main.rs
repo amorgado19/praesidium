@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -226,6 +226,20 @@ const ISOLATION_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P5B-OK",
 ];
 
+/// P6 (loader): P5 plus the capability-invocation ABI + `.pex` loader (ADR-0006). A `.pex` parses
+/// (malformed refused), the loader mints exactly the manifest caps + maps W^X segments, `invoke`
+/// resolves cptrs + rights-checks, and a bad-rights invoke is refused (AC6.1–AC6.4). EL0 dispatch
+/// of the loaded process is P7.
+const LOADER_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-P5B-OK",
+    ".pex loaded — entry",                       // AC6.2/6.3: parsed + loaded
+    "segments mapped W^X — code R-X",            // AC6.3
+    "process holds EXACTLY its 4 manifest caps", // AC6.4: no ambient authority
+    "invoke resolves cptrs + rights-checked",    // AC6.1: dispatch + bad-rights refused
+    "malformed .pex refused",                    // AC6.2
+    "PRAESIDIUM-P6-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -269,6 +283,12 @@ const SCENARIOS: &[Scenario] = &[
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P5B-OK",
     },
+    Scenario {
+        name: "loader",
+        required: LOADER_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-P6-OK",
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -299,7 +319,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -316,9 +336,9 @@ fn cmd_build(args: &[String]) -> Result<bool, String> {
 fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let arch = arch_from(args)?;
     let use_tpm = !flag(args, "--no-tpm");
-    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "isolation".into());
+    let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "loader".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader)")
     })?;
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))

@@ -16,9 +16,12 @@ mod timer;
 pub use context::{context_init, context_switch, Context};
 pub use interrupts::{contains_raw_read, interrupts_init};
 pub use mte::domain_escape_contained;
+
+/// The `.pex` architecture tag for this backend (ADR-0006) — see the x86-64 backend.
+pub const PEX_ARCH: u16 = abi::pex::ARCH_AARCH64;
 pub use paging::{
-    activate_address_space, build_address_space, enable_wx, install_guard_page, page_prot,
-    translate,
+    activate_address_space, build_address_space, enable_wx, install_guard_page, map_page,
+    page_prot, sync_instruction_cache, translate,
 };
 pub use timer::timer_init;
 

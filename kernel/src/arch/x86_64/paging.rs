@@ -259,19 +259,28 @@ fn invlpg(vaddr: u64) {
 /// (a re-allocated frame would otherwise inherit a non-present alias).
 pub unsafe fn install_guard_page(vaddr: u64) {
     let v = vaddr & !0xfff; // page-align
+    let pt = ensure_pt(v);
+    write_entry(pt, idx(v, 0), 0); // non-present ⇒ the guard
+    invlpg(v);
+}
+
+/// Walk to `v`'s PD entry and, if it is a 2 MiB huge page, split it into a fresh 512-entry PT with
+/// identical attributes; returns the PT's physical address. The PT is built in full before the PD
+/// entry is swung to point at it (a single aligned store), so the walker never sees a half-built
+/// table — the split preserves every other translation in the window. Shared by
+/// [`install_guard_page`] and [`map_page`]. `v` must be page-aligned.
+fn ensure_pt(v: u64) -> u64 {
     let e4 = read_entry(current_pml4(), idx(v, 3));
-    assert!(e4 & PRESENT != 0, "guard page: PML4 entry absent");
+    assert!(e4 & PRESENT != 0, "ensure_pt: PML4 entry absent");
     let e3 = read_entry(e4 & ADDR_MASK, idx(v, 2));
     assert!(
         e3 & PRESENT != 0 && e3 & HUGE == 0,
-        "guard page: unexpected 1 GiB mapping"
+        "ensure_pt: unexpected 1 GiB mapping"
     );
     let pd = e3 & ADDR_MASK;
     let e2 = read_entry(pd, idx(v, 1));
-    assert!(e2 & PRESENT != 0, "guard page: PD entry absent");
-
-    let pt = if e2 & HUGE != 0 {
-        // Split the 2 MiB huge page into 512 × 4 KiB entries with identical attributes.
+    assert!(e2 & PRESENT != 0, "ensure_pt: PD entry absent");
+    if e2 & HUGE != 0 {
         let base = e2 & ADDR_MASK & !0x1f_ffff; // 2 MiB-aligned physical base
         let flags = e2 & !ADDR_MASK & !HUGE; // PRESENT|WRITABLE|NX (drop the PS/huge bit)
         let new_pt = alloc_table();
@@ -282,10 +291,39 @@ pub unsafe fn install_guard_page(vaddr: u64) {
         new_pt
     } else {
         e2 & ADDR_MASK
-    };
+    }
+}
 
-    write_entry(pt, idx(v, 0), 0); // non-present ⇒ the guard
+/// Map the 4 KiB page at `vaddr` to physical `phys` with protection `prot` in the active tables
+/// (splitting the covering 2 MiB page first if needed), enforcing W^X via [`leaf_bits`]. Used by
+/// the P6 loader to place a `.pex` segment at its declared virtual address — a `Prot::Rx` code
+/// page is mapped read-execute, never writable (the writable HHDM alias the loader used to copy
+/// the bytes is a separate mapping the loaded process cannot name).
+///
+/// # Safety
+/// `vaddr` must be a page the caller owns/controls in the single address space; `phys` must be a
+/// frame the caller owns. Overwrites any existing mapping of `vaddr` (e.g. its identity alias).
+pub unsafe fn map_page(vaddr: u64, phys: u64, prot: Prot) {
+    let v = vaddr & !0xfff;
+    let pt = ensure_pt(v);
+    write_entry(pt, idx(v, 0), (phys & ADDR_MASK) | leaf_bits(prot));
     invlpg(v);
+}
+
+/// Make `len` bytes at `vaddr` coherent for instruction fetch after the loader has written code
+/// there through the data path (ADR-0006 / GC-09 — the cache-maintenance seam owed since P0, now
+/// that P6 first copies-then-executes code).
+///
+/// On x86-64 the instruction and data caches are **coherent** for the same physical memory
+/// (Intel SDM Vol 3 §11.6): a store made before an instruction fetch of newly-written code is
+/// observed, so no explicit invalidation is required. We still emit a store fence to order the
+/// segment writes before any later transfer of control into the code (the actual EL-transition /
+/// jump into loaded code is a serializing event, added in P7). `vaddr`/`len` are unused here but
+/// keep the seam identical to aarch64, where they are load-bearing.
+pub fn sync_instruction_cache(_vaddr: u64, _len: usize) {
+    // SAFETY: `mfence` orders prior stores (the copied code) ahead of subsequent memory ops; it
+    // has no other effect. Absence of `nomem` makes it a compiler barrier too.
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
 }
 
 /// Build a **per-domain page table** (isolation Layer 2 fallback, DEC-0008-6): a clone of the

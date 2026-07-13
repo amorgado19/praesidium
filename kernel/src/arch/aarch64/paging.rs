@@ -311,3 +311,58 @@ fn flush_page(v: u64) {
         );
     }
 }
+
+/// Map the 4 KiB page at `vaddr` to physical `phys` with protection `prot` in the active tables
+/// (splitting the covering 2 MiB block first if needed), enforcing W^X via [`page_desc`]. Used by
+/// the P6 loader to place a `.pex` segment at its declared virtual address — a `Prot::Rx` code
+/// page is mapped read-execute at EL1, never writable.
+///
+/// # Safety
+/// `vaddr` must be a page the caller controls in the single address space; `phys` must be a frame
+/// the caller owns. Overwrites any existing mapping of `vaddr` (e.g. its identity alias).
+pub unsafe fn map_page(vaddr: u64, phys: u64, prot: Prot) {
+    let v = vaddr & !0xfff;
+    let l3 = ensure_l3_table(v);
+    write_entry(l3, lidx(v, 3), page_desc(phys & ADDR_MASK, prot));
+    flush_page(v);
+}
+
+/// Make `len` bytes at `vaddr` coherent for instruction fetch after code has been written there
+/// through the data path (ADR-0006 / GC-09 — the cache-maintenance seam owed since P0, now that
+/// P6 first copies-then-executes code). **Load-bearing on aarch64:** the I- and D-caches are NOT
+/// coherent, so freshly-written code is fetched stale unless the D-cache is cleaned to the Point
+/// of Unification and the I-cache invalidated. The canonical sequence, per line size read from
+/// `CTR_EL0` (a larger step would skip lines): `dc cvau` over the range → `dsb ish` → `ic ivau`
+/// over the range → `dsb ish` → `isb`. Cache ops are by VA but act on the PA (PIPT), so cleaning
+/// via the write alias covers execution through any alias of the same frame.
+pub fn sync_instruction_cache(vaddr: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: u64;
+    // SAFETY: reading CTR_EL0 is side-effect-free; it reports the cache line geometry.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let dline = 4u64 << ((ctr >> 16) & 0xf); // DminLine: log2(words) in bits [19:16]
+    let iline = 4u64 << (ctr & 0xf); // IminLine: log2(words) in bits [3:0]
+    let end = vaddr + len as u64;
+
+    // Clean D-cache to PoU across the range, then publish before invalidating the I-cache.
+    let mut a = vaddr & !(dline - 1);
+    while a < end {
+        // SAFETY: `dc cvau` cleans the data cache line for `a` to the Point of Unification; `a`
+        // is a mapped, readable address within the range the caller just wrote.
+        unsafe { asm!("dc cvau, {}", in(reg) a, options(nostack, preserves_flags)) };
+        a += dline;
+    }
+    // SAFETY: order the D-cache cleans before the I-cache invalidations.
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+
+    let mut a = vaddr & !(iline - 1);
+    while a < end {
+        // SAFETY: `ic ivau` invalidates the instruction cache line for `a` to the PoU.
+        unsafe { asm!("ic ivau, {}", in(reg) a, options(nostack, preserves_flags)) };
+        a += iline;
+    }
+    // SAFETY: complete the invalidations and re-synchronise the fetch stream.
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
