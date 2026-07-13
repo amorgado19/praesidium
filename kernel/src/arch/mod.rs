@@ -84,7 +84,8 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     activate_address_space, build_address_space, contains_raw_read, context_init, context_switch,
-    domain_escape_contained, el0_supported, el0_test_blob, enable_wx, enter_user, halt,
+    domain_escape_contained, el0_fault_blob, el0_supported, el0_test_blob, enable_wx, enter_user,
+    halt,
     install_guard_page, interrupts_init, map_page, map_user_page, memory_barrier, page_prot,
     preempt_disable, preempt_enable, preempt_restore, read_translation_root, serial_init,
     serial_write_byte, sync_instruction_cache, timer_init, translate, wait_for_interrupt, Context,
@@ -96,7 +97,8 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     activate_address_space, build_address_space, contains_raw_read, context_init, context_switch,
-    domain_escape_contained, el0_supported, el0_test_blob, enable_wx, enter_user, halt,
+    domain_escape_contained, el0_fault_blob, el0_supported, el0_test_blob, enable_wx, enter_user,
+    halt,
     install_guard_page, interrupts_init, map_page, map_user_page, memory_barrier, page_prot,
     preempt_disable, preempt_enable, preempt_restore, read_translation_root, serial_init,
     serial_write_byte, sync_instruction_cache, timer_init, translate, wait_for_interrupt, Context,

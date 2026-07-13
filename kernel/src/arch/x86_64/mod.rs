@@ -38,6 +38,12 @@ pub unsafe fn enter_user(_entry: u64, _user_sp: u64) -> ! {
 pub fn el0_test_blob() -> &'static [u8] {
     &[]
 }
+
+/// The bring-up fault blob — none on x86-64 until ring 3 is wired.
+#[must_use]
+pub fn el0_fault_blob() -> &'static [u8] {
+    &[]
+}
 pub use timer::timer_init;
 
 /// The `.pex` architecture tag for this backend (ADR-0006): a `.pex`'s segments are native code,

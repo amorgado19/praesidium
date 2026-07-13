@@ -18,18 +18,18 @@
 /// path (ADR-0004). A register-only payload keeps the boundary hot and nothing to bulk-validate.
 pub const MSG_REGS: usize = 4;
 
-/// Syscall selectors, carried in the syscall-number register at the trap boundary (aarch64 `x8` /
-/// x86-64 `rax`) — the kernel's EL0/ring-3 trap dispatches on this. `INVOKE` carries an
-/// [`Invocation`] in the remaining argument registers; `DEBUG`/`EXIT` are the minimal process
-/// lifecycle a reference process needs. This is the arch-generic contract; the concrete register
-/// assignment is arch-specific (behind the ADR-0007 seam).
+/// The syscall selector carried in the syscall-number register at the trap boundary (aarch64 `x8`
+/// / x86-64 `rax`). There is exactly one — `INVOKE` — because every syscall is a capability
+/// invocation (DEC-0006-3): `INVOKE` carries an [`Invocation`] in the remaining argument registers.
+/// This is the arch-generic contract; the concrete register assignment is arch-specific (behind the
+/// ADR-0007 seam).
 pub mod sys {
     /// Perform a capability invocation (the argument registers carry the [`super::Invocation`]).
+    /// The ONLY syscall selector: every syscall is an invocation on a capability, so there is no
+    /// ambient "debug"/"exit" syscall — those are *operations* ([`super::op::DEBUG_EMIT`] /
+    /// [`super::op::PROC_EXIT`]) invoked on a capability the process holds, enforcing the Root
+    /// Invariant (no ambient authority) at the trap boundary.
     pub const INVOKE: u64 = 0;
-    /// Bring-up: log the value in the first argument register over the kernel's serial console.
-    pub const DEBUG: u64 = 1;
-    /// Terminate the calling process (the first argument register is the exit code).
-    pub const EXIT: u64 = 2;
 }
 
 /// Operation selectors. Stable wire values (they cross the user/kernel boundary). Kept tiny in
@@ -44,6 +44,17 @@ pub mod op {
     /// Send on an `Endpoint` capability — **requires the `SEND` right**; routes into the IPC
     /// machinery (ADR-0004). This is a syscall *and* an IPC call through one path (DEC-0006-3).
     pub const ENDPOINT_SEND: u16 = 3;
+
+    /// **Bring-up only (P7a).** Emit the first argument register to the kernel's serial console — a
+    /// capability-gated debug affordance modelled as a send to the process's bring-up-service
+    /// Endpoint (DEC-0006-3): **requires the `SEND` right on an `Endpoint`**, so an EL0 process
+    /// holding no such capability cannot reach the console (no ambient authority). Retired when a
+    /// real console/log capability arrives (post-v1).
+    pub const DEBUG_EMIT: u16 = 0x10;
+    /// Terminate the calling process with the exit code in the first argument register — modelled
+    /// as a send to the process's bring-up-service Endpoint (**requires `SEND` on an `Endpoint`**).
+    /// The real self-termination authority (invoking the process's own `Task`/`Sched` cap) is P7b.
+    pub const PROC_EXIT: u16 = 0x11;
 }
 
 /// A capability invocation: perform `op` on the capability at `cptr`, with `args`. The concrete

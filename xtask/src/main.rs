@@ -244,9 +244,10 @@ const LOADER_REQUIRED: &[&str] = &[
 /// syscall trap (aarch64; x86-64 ring 3 is a follow-on). Bring-up validation gate.
 const USER_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P6-OK",
-    "EL0 userspace transport",  // entered P7a
-    "EL0 syscall DEBUG value=0xbeef", // the process ran real EL0 code + trapped a syscall
-    "process exited (code 0)",  // clean exit via syscall
+    "EL0 userspace transport",        // entered P7a
+    "EL0 syscall DEBUG value=0xbeef", // real EL0 code made a capability-mediated syscall
+    "process exited (code 0)",        // clean exit via a capability invocation
+    "EL0 fault CONTAINED",            // an EL0 raw read of a supervisor page killed the process, kernel survived
     "PRAESIDIUM-P7A-OK",
 ];
 

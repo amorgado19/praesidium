@@ -56,6 +56,22 @@ pub fn invoke<const N: usize>(cs: &CSpace<N>, inv: &Invocation) -> Result<u64, I
             Ok(cap.badge) // acknowledge the routed send (badge identifies the sender to the server)
         }
 
+        // Bring-up (P7a): DEBUG_EMIT / PROC_EXIT are capability-gated process affordances modelled
+        // as sends to the process's bring-up-service Endpoint (DEC-0006-3) — each REQUIRES `SEND`
+        // on an `Endpoint`, so an EL0 process with no such capability reaches neither the console
+        // nor a clean exit (RI: no ambient authority). The dispatch only resolves + rights-checks
+        // and returns the argument word; the *effect* (log / terminate) is performed by the caller,
+        // since a divergent exit cannot be expressed through this value-returning dispatch.
+        op::DEBUG_EMIT | op::PROC_EXIT => {
+            if cap.cap_type != CapType::Endpoint {
+                return Err(InvokeError::WrongType);
+            }
+            if !cap.rights.contains(Rights::SEND) {
+                return Err(InvokeError::InsufficientRights);
+            }
+            Ok(inv.args[0])
+        }
+
         _ => Err(InvokeError::UnknownOp),
     }
 }
