@@ -313,17 +313,64 @@ pub unsafe fn map_page(vaddr: u64, phys: u64, prot: Prot) {
 /// Page-table entry bit granting ring-3 (user) access to a page (U/S).
 const USER: u64 = 1 << 2;
 
+/// Like [`ensure_pt`], but also sets the USER (U/S) bit on every intermediate entry along the path
+/// (PML4E, PDPTE, PDE). **Load-bearing on x86:** a ring-3 access is permitted only if USER is set at
+/// EVERY paging level, so setting it solely on the leaf makes the walk fault at the supervisor
+/// intermediate the identity map created. Setting USER on an intermediate is *permissive* — the
+/// leaf's own USER bit is the actual per-page gate, so kernel pages sharing these intermediates keep
+/// leaf USER=0 and stay supervisor-only. When a covering 2 MiB huge page is split, the copied leaves
+/// get NO USER bit (they stay supervisor); only the PDE pointing at the new PT gets USER. Returns
+/// the PT's physical address. `v` must be page-aligned.
+fn ensure_pt_user(v: u64) -> u64 {
+    let pml4 = current_pml4();
+    let e4 = read_entry(pml4, idx(v, 3));
+    assert!(e4 & PRESENT != 0, "ensure_pt_user: PML4 entry absent");
+    if e4 & USER == 0 {
+        write_entry(pml4, idx(v, 3), e4 | USER);
+    }
+    let pdpt = e4 & ADDR_MASK;
+    let e3 = read_entry(pdpt, idx(v, 2));
+    assert!(
+        e3 & PRESENT != 0 && e3 & HUGE == 0,
+        "ensure_pt_user: unexpected 1 GiB mapping"
+    );
+    if e3 & USER == 0 {
+        write_entry(pdpt, idx(v, 2), e3 | USER);
+    }
+    let pd = e3 & ADDR_MASK;
+    let e2 = read_entry(pd, idx(v, 1));
+    assert!(e2 & PRESENT != 0, "ensure_pt_user: PD entry absent");
+    if e2 & HUGE != 0 {
+        // Split the covering 2 MiB huge page: the copied 4 KiB leaves keep the huge page's attrs
+        // WITHOUT USER (they stay supervisor); only the PDE pointing at the new PT gets USER.
+        let base = e2 & ADDR_MASK & !0x1f_ffff;
+        let flags = e2 & !ADDR_MASK & !HUGE; // PRESENT|WRITABLE|NX (drop PS/huge)
+        let new_pt = alloc_table();
+        for j in 0..512u64 {
+            write_entry(new_pt, j as usize, (base + j * PAGE) | flags);
+        }
+        write_entry(pd, idx(v, 1), new_pt | PRESENT | WRITABLE | USER);
+        new_pt
+    } else {
+        if e2 & USER == 0 {
+            write_entry(pd, idx(v, 1), e2 | USER);
+        }
+        e2 & ADDR_MASK
+    }
+}
+
 /// Map the 4 KiB page at `vaddr` to physical `phys` as a **ring-3 (user) accessible** page with
-/// protection `prot` (W^X via [`leaf_bits`]), splitting the covering 2 MiB page first if needed.
-/// Used by the P7 loader to place a userspace process's segments so ring 3 can reach them, while
-/// the kernel/HHDM stay supervisor-only (a ring-3 raw pointer into kernel memory faults).
+/// protection `prot` (W^X via [`leaf_bits`]), splitting the covering 2 MiB page first if needed and
+/// setting the USER bit on every paging level (see [`ensure_pt_user`]). Used by the P7 loader to
+/// place a userspace process's segments so ring 3 can reach them, while the kernel/HHDM stay
+/// supervisor-only (a ring-3 raw pointer into kernel memory faults on the supervisor-only leaf).
 ///
 /// # Safety
 /// `vaddr` must be a page in the process's reserved VA window the caller controls; `phys` a frame
 /// the caller owns. Overwrites any existing mapping of `vaddr`.
 pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot) {
     let v = vaddr & !0xfff;
-    let pt = ensure_pt(v);
+    let pt = ensure_pt_user(v);
     write_entry(pt, idx(v, 0), (phys & ADDR_MASK) | leaf_bits(prot) | USER);
     invlpg(v);
 }

@@ -44,10 +44,11 @@ static PROC_CS: SpinLock<Option<CSpace<PROC_SLOTS>>> = SpinLock::new(None);
 /// processes (they run one at a time).
 const USER_CODE_VA: u64 = 0x4010_0000;
 const USER_STACK_VA: u64 = 0x4011_0000;
-/// A **supervisor-only** probe page (mapped via [`arch::map_page`], no EL0 access) the fault
-/// bring-up process reads to trigger an EL0 permission fault. MUST equal the address the aarch64
-/// fault blob loads (`arch/aarch64/user.rs` `praesidium_el0_fault_blob`: `0x4012_0000`).
-const FAULT_PROBE_VA: u64 = 0x4012_0000;
+/// A **supervisor-only** probe page (mapped via [`arch::map_page`], no user access) the fault
+/// bring-up process reads to trigger a userspace permission fault. `pub` so the arch fault blobs
+/// can name it (a `const` operand); the aarch64 blob hardcodes it (`0x4012_0000`) via `movz` — keep
+/// them in sync. x86-64 references this const directly.
+pub const FAULT_PROBE_VA: u64 = 0x4012_0000;
 const PAGE: usize = 4096;
 
 /// The CSpace slot holding the process's one capability (its bring-up-service `Endpoint`). `pub`
@@ -110,8 +111,7 @@ fn setup_process_cspace() {
 /// — no held capability ⇒ refused, there is no ambient path. On success the *effect* is applied
 /// here (a divergent exit cannot be expressed through the value-returning dispatch): `DEBUG_EMIT`
 /// logs the value; `PROC_EXIT` retires the process; any other op returns its result word to EL0.
-// Called by the arch EL0 trap handler — live on aarch64 in P7a; wired on x86-64 once ring 3 lands.
-#[allow(dead_code)]
+// Called by the arch EL0/ring-3 syscall trap handlers (both arches).
 pub fn syscall(inv: &Invocation) -> u64 {
     // Release the CSpace lock BEFORE any divergence: `exit_current` never returns, so a held guard
     // would never drop (deadlocking the next process's access).
@@ -150,8 +150,7 @@ pub fn syscall(inv: &Invocation) -> u64 {
 
 /// Handle a userspace fault (an EL0 access that trapped — a bug or a hostile raw pointer). The
 /// **process** is killed, not the kernel; the kernel keeps running. Never returns.
-// Called by the arch EL0 trap handler — live on aarch64 in P7a; wired on x86-64 once ring 3 lands.
-#[allow(dead_code)]
+// Called by the arch EL0/ring-3 trap handlers (both arches) on a userspace fault.
 pub fn fault(kind: &str, addr: u64) -> ! {
     kprintln!("[praesidium] user: EL0 fault ({kind} at {addr:#x}) — killing the process, kernel survives");
     EXIT_CODE.store(u64::MAX, Ordering::Relaxed);

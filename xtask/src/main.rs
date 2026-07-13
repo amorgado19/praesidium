@@ -251,16 +251,6 @@ const USER_REQUIRED: &[&str] = &[
     "PRAESIDIUM-P7A-OK",
 ];
 
-/// P7a (user) on x86-64: ring 3 is a follow-on (the aarch64 EL0 path is validated first), so
-/// `user::run()` cleanly reports the skip. The scenario still proves the kernel reached P7a and
-/// halted cleanly — it just does not assert an EL0 round-trip. Retired once x86 ring 3 lands and
-/// x86 emits the full `PRAESIDIUM-P7A-OK` markers like aarch64.
-const USER_REQUIRED_X86: &[&str] = &[
-    "PRAESIDIUM-P6-OK",
-    "EL0 userspace transport", // reached P7a bring-up
-    "PRAESIDIUM-P7A-SKIP",     // cleanly skipped (ring 3 pending) — NOT an EL0 run
-];
-
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -367,13 +357,7 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let sc = scenario(&scenario_name).ok_or_else(|| {
         format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user)")
     })?;
-    // Arch-gate: a scenario whose x86-64 path is a follow-on (here, P7a's ring 3) asserts a
-    // reduced, arch-appropriate marker set on x86 so `smoke --arch x86_64` reflects reality instead
-    // of failing by construction. aarch64 (and every other scenario) uses the full required/success.
-    let (required, success): (&[&str], &str) = match (arch.name, sc.name) {
-        ("x86_64", "user") => (USER_REQUIRED_X86, "PRAESIDIUM-P7A-SKIP"),
-        _ => (sc.required, sc.success),
-    };
+    let (required, success): (&[&str], &str) = (sc.required, sc.success);
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))
         .transpose()?

@@ -10,41 +10,15 @@ mod context;
 mod interrupts;
 mod paging;
 mod timer;
+mod user;
 pub use context::{context_init, context_switch, Context};
 pub use interrupts::{contains_raw_read, interrupts_init};
 pub use paging::{
     activate_address_space, build_address_space, build_domain_excluding, enable_wx,
     install_guard_page, map_page, map_user_page, page_prot, sync_instruction_cache, translate,
 };
-
-/// Whether this backend can run ring-3 userspace yet. **False in P7a:** x86-64 ring 3 needs a GDT
-/// (ring-3 segments) + a TSS (RSP0) + the `syscall`/`sysret` MSRs, built after the aarch64 EL0
-/// path is validated. The generic [`crate::user`] path skips EL0 while this is false.
-#[must_use]
-pub fn el0_supported() -> bool {
-    false
-}
-
-/// Drop to ring 3 — unbuilt on x86-64 in P7a.
-///
-/// # Safety
-/// Never called while [`el0_supported`] returns false.
-pub unsafe fn enter_user(_entry: u64, _user_sp: u64) -> ! {
-    unreachable!("x86-64 ring-3 userspace is not wired yet (P7a builds aarch64 first)");
-}
-
-/// The bring-up user blob — none on x86-64 until ring 3 is wired.
-#[must_use]
-pub fn el0_test_blob() -> &'static [u8] {
-    &[]
-}
-
-/// The bring-up fault blob — none on x86-64 until ring 3 is wired.
-#[must_use]
-pub fn el0_fault_blob() -> &'static [u8] {
-    &[]
-}
 pub use timer::timer_init;
+pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user};
 
 /// The `.pex` architecture tag for this backend (ADR-0006): a `.pex`'s segments are native code,
 /// so the loader only accepts images tagged for the arch it runs on. Behind the seam so nothing

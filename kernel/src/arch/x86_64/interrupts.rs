@@ -24,6 +24,10 @@ pub const TIMER_VECTOR: u8 = 32;
 /// Build, install (`lidt`), and leave the IDT active. The table is leaked so it lives for the
 /// kernel's lifetime, as `lidt` records a bare pointer.
 pub fn interrupts_init() {
+    // The GDT + TSS + syscall MSRs must be installed BEFORE the IDT: `set_handler_fn` captures the
+    // current CS into each gate, so we load our own kernel CS first (P7a ring-3 support).
+    super::user::gdt_init();
+
     let idt: &'static mut InterruptDescriptorTable =
         Box::leak(Box::new(InterruptDescriptorTable::new()));
 
@@ -49,24 +53,42 @@ fn fault(name: &str, frame: &InterruptStackFrame) -> ! {
     crate::arch::halt();
 }
 
+/// If a CPU exception came from ring 3 (a userspace process), kill THAT process and keep the kernel
+/// running (P7a: ring 3 is isolated from the kernel — a userspace fault is contained, never fatal).
+/// `code_segment.0 & 3` is the saved CS's RPL. Never returns when the fault was from ring 3.
+fn kill_if_userspace(kind: &str, frame: &InterruptStackFrame) {
+    if frame.code_segment.0 & 3 == 3 {
+        crate::user::fault(kind, frame.instruction_pointer.as_u64()); // -> ! (kills the process)
+    }
+}
+
 extern "x86-interrupt" fn ex_divide(frame: InterruptStackFrame) {
+    kill_if_userspace("#DE (divide)", &frame);
     fault("#DE (divide)", &frame);
 }
 extern "x86-interrupt" fn ex_invalid_opcode(frame: InterruptStackFrame) {
+    kill_if_userspace("#UD (invalid opcode)", &frame);
     fault("#UD (invalid opcode)", &frame);
 }
 extern "x86-interrupt" fn ex_gpf(frame: InterruptStackFrame, _err: u64) {
+    kill_if_userspace("#GP (general protection)", &frame);
     fault("#GP (general protection)", &frame);
 }
 extern "x86-interrupt" fn ex_stack_segment(frame: InterruptStackFrame, _err: u64) {
+    kill_if_userspace("#SS (stack segment)", &frame);
     fault("#SS (stack segment)", &frame);
 }
-extern "x86-interrupt" fn ex_page_fault(mut frame: InterruptStackFrame, _err: PageFaultErrorCode) {
+extern "x86-interrupt" fn ex_page_fault(mut frame: InterruptStackFrame, err: PageFaultErrorCode) {
     let cr2: u64;
     // SAFETY: reading CR2 (the faulting address) is side-effect-free.
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags))
     };
+    // Ring-3 (userspace) page fault: kill the faulting process, not the kernel (P7a). The U/S error
+    // bit is set iff the access came from CPL 3 — e.g. a ring-3 raw read of a supervisor page.
+    if err.contains(PageFaultErrorCode::USER_MODE) {
+        crate::user::fault("#PF (page fault)", cr2); // -> ! (kills the process; kernel survives)
+    }
     // Single-shot recoverable path (P5b): if this is exactly the deliberate isolation-escape
     // probe we armed at this address, contain it (resume at the probe's recovery label) instead
     // of failing closed. Any other #PF — or a #PF at the wrong address — is a real bug: FATAL.

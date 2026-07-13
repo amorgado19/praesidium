@@ -196,8 +196,7 @@ pub extern "C" fn task_enter() -> ! {
 /// exiting via a syscall or being killed on a fault, called from the EL0 trap handler running on
 /// that task's kernel stack. Marks it finished and schedules away for good (its kernel stack, and
 /// the abandoned handler frame on it, are discarded — the task never resumes).
-// Called by the arch EL0 trap handler — live on aarch64 in P7a; wired on x86-64 once ring 3 lands.
-#[allow(dead_code)]
+// Called by the arch EL0/ring-3 trap handlers (both arches) when a process exits or is killed.
 pub fn exit_current() -> ! {
     task_exit();
 }
