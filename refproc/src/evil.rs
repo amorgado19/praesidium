@@ -9,13 +9,15 @@
 #![no_std]
 #![no_main]
 
-/// The victim virtual address `evil` raw-reads: `pong`'s segment base. Must equal xtask's
-/// `--defsym __base` for `pong` (`0x40300000`).
-const VICTIM_VA: usize = 0x4030_0000;
-/// `pong`'s isolation domain (the loader assigns ping=1, pong=2, evil=3 — a predictable assignment
-/// an attacker knows or brute-forces over 4 bits). Used to forge pong's MTE tag on aarch64.
+/// The victim virtual address `evil` raw-reads: `ping`'s segment base (`ping`'s linker default
+/// `__base = 0x40100000`). This VA is in the [1 GiB, 1 GiB+2 MiB) block the P6 loader demo splits on
+/// the kernel base, so it is the case a shared-leaf-table bug in new_process_space would breach —
+/// per-domain tables must isolate it too (not just the un-split blocks pong/evil live in).
+const VICTIM_VA: usize = 0x4010_0000;
+/// `ping`'s isolation domain (the loader assigns ping=1, pong=2, evil=3 — a predictable assignment
+/// an attacker knows or brute-forces over 4 bits). Used to forge ping's MTE tag on aarch64.
 #[cfg(target_arch = "aarch64")]
-const VICTIM_DOMAIN: u64 = 2;
+const VICTIM_DOMAIN: u64 = 1;
 
 /// Process entry — dropped to at EL0/ring-3 with GPRs zeroed. `evil` attempts to defeat the hardware
 /// isolation domain, then reads the victim's page. The backstop must trap the read regardless; the

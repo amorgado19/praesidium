@@ -183,6 +183,18 @@ pub fn new_process_space() -> AddressSpace {
     let e1 = read_entry(e0 & ADDR_MASK, 1); // L1[1] -> L2 covering [1 GiB, 2 GiB)
     let new_l2 = clone_table(e1 & ADDR_MASK);
     write_entry(new_l1, 1, new_l2 | (e1 & !ADDR_MASK));
+    // A value-copy of the L2 SHARES any already-split L3 leaf in this window. The kernel base may
+    // have split a 2 MiB block here (e.g. the P6 loader demo maps at 0x4000_0000), so without this a
+    // process's map_user_page would write its user page into an L3 table SHARED with the base + every
+    // other process — an isolation escape. Privatise every split leaf (a TABLE descriptor, not a
+    // 2 MiB BLOCK): deep-copy it into a fresh frame so each process's window leaves are its own.
+    for i in 0..512 {
+        let e = read_entry(new_l2, i);
+        if e & VALID != 0 && e & 0b11 == TABLE {
+            let priv_l3 = clone_table(e & ADDR_MASK);
+            write_entry(new_l2, i, priv_l3 | (e & !ADDR_MASK));
+        }
+    }
     AddressSpace {
         primary: KERNEL_TTBR1.load(Ordering::Relaxed),
         secondary: new_l0,

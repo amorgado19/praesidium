@@ -230,8 +230,13 @@ fn ipc_recv(id: usize, inv: &Invocation) -> u64 {
     ipc_check(id, inv);
     let (caller, msg) = loop {
         {
-            let r = EP_RDV.lock();
+            let mut r = EP_RDV.lock();
             if let Some(c) = r.caller {
+                // Consume the caller slot as the message is taken, so a receiver that RECVs again
+                // before replying does not re-observe the same caller + re-mint a Reply cap (the
+                // caller identity is now carried by the minted Reply cap; the caller unblocks on
+                // `reply`, not `caller`). Hardens the single-slot rendezvous against a hostile server.
+                r.caller = None;
                 break (c, r.msg);
             }
         }
@@ -515,8 +520,8 @@ pub fn run_processes() {
 /// native binary — distinct from P5b's *armed* in-kernel proof. Emits `PRAESIDIUM-P7B-II-OK`.
 fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr) {
     kprintln!(
-        "[praesidium] user: P7b-ii AC7.3 red-team — loading HOSTILE evil.pex (it raw-reads pong's memory at {:#x})",
-        PONG_STACK_VA - 0x10_0000 // pong's segment base 0x4030_0000 (see evil::VICTIM_VA)
+        "[praesidium] user: P7b-ii AC7.3 red-team — loading HOSTILE evil.pex (it raw-reads ping's memory at {:#x}, in the demo-split window)",
+        PING_STACK_VA - 0x10_0000 // ping's segment base 0x4010_0000 (see evil::VICTIM_VA)
     );
     let (evil_entry, evil_sp, evil_space) =
         load_process(loader, scratch, EVIL_PEX, DOMAIN_EVIL, EVIL, EVIL_STACK_VA, "evil");

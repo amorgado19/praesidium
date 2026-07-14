@@ -162,6 +162,19 @@ pub fn new_process_space() -> AddressSpace {
     let e1 = read_entry(e0 & ADDR_MASK, 1); // PDPT[1] -> PD covering [1 GiB, 2 GiB)
     let new_pd = clone_table(e1 & ADDR_MASK);
     write_entry(new_pdpt, 1, new_pd | (e1 & !ADDR_MASK));
+    // A value-copy of the PD SHARES any already-split leaf PT in this window. The kernel base may
+    // have split a 2 MiB block here (e.g. the P6 loader demo maps at 0x4000_0000), so without this a
+    // process's map_user_page would write its user page into a leaf table SHARED with the base +
+    // every other process — an isolation escape for that block. Privatise every split leaf: deep-copy
+    // it into a fresh frame so each process's window leaves are its own (un-split huge blocks stay
+    // shared read-only identity, which the process splits privately on demand).
+    for i in 0..512 {
+        let e = read_entry(new_pd, i);
+        if e & PRESENT != 0 && e & HUGE == 0 {
+            let priv_pt = clone_table(e & ADDR_MASK);
+            write_entry(new_pd, i, priv_pt | (e & !ADDR_MASK));
+        }
+    }
     AddressSpace {
         primary: new_pml4,
         secondary: 0,
