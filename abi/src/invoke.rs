@@ -55,6 +55,19 @@ pub mod op {
     /// as a send to the process's bring-up-service Endpoint (**requires `SEND` on an `Endpoint`**).
     /// The real self-termination authority (invoking the process's own `Task`/`Sched` cap) is P7b.
     pub const PROC_EXIT: u16 = 0x11;
+
+    /// **Cross-process IPC (P7b, AC7.2).** CALL on an `Endpoint` (**requires `SEND`**): send the
+    /// first argument register to whoever holds a RECV cap to the same Endpoint, block for a
+    /// one-word reply, and return it. The synchronous call/reply of ADR-0004, over the shared
+    /// Endpoint capability — cross-process, no address-space swap (SASOS).
+    pub const ENDPOINT_CALL: u16 = 0x20;
+    /// RECV on an `Endpoint` (**requires `RECV`**): block until a caller's [`ENDPOINT_CALL`] arrives,
+    /// return its message word, and receive a single-use `Reply` capability (minted at a fixed slot
+    /// the runtime knows) for the ensuing [`ENDPOINT_REPLY`].
+    pub const ENDPOINT_RECV: u16 = 0x21;
+    /// REPLY on the single-use `Reply` capability RECV minted (**consumes it**, CAP-REPLY-1): deliver
+    /// the first argument register to the one blocked caller it names, unblocking it.
+    pub const ENDPOINT_REPLY: u16 = 0x22;
 }
 
 /// A capability invocation: perform `op` on the capability at `cptr`, with `args`. The concrete

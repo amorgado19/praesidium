@@ -48,6 +48,27 @@ static PROC_EXIT: [AtomicU64; MAX_PROCS] = [
     AtomicU64::new(0),
 ];
 
+/// The CSpace slot the kernel mints a process's single-use `Reply` capability into on RECV (matches
+/// `refproc::REPLY`); the process invokes it to REPLY. Free of the manifest slots (1=Sched, 2=Endpoint).
+const REPLY_SLOT: Cptr = 3;
+
+/// The cross-process IPC rendezvous over the shared Endpoint (P7b runs one Endpoint). A `caller`
+/// posts a `msg` and blocks (spin-yielding to the receiver) for `reply`; the receiver takes the
+/// message, mints a single-use `Reply` cap naming the caller, and (on REPLY) sets `reply`,
+/// unblocking the caller — synchronous call/reply over the stackful scheduler, NO address-space
+/// swap (SASOS). Reuses cap-core's single-use Reply (`mint_reply`/`consume_reply`, CAP-REPLY-1); a
+/// real per-Endpoint registry keyed by objref generalises this single-Endpoint rendezvous.
+struct Rdv {
+    caller: Option<usize>,
+    msg: u64,
+    reply: Option<u64>,
+}
+static EP_RDV: SpinLock<Rdv> = SpinLock::new(Rdv {
+    caller: None,
+    msg: 0,
+    reply: None,
+});
+
 // ---- P7a in-kernel bring-up blob VAs (the transport + fault-kill regression) ----
 const USER_CODE_VA: u64 = 0x4010_0000;
 const USER_STACK_VA: u64 = 0x4011_0000;
@@ -115,34 +136,124 @@ fn retire(id: usize, code: u64) -> ! {
 pub fn syscall(inv: &Invocation) -> u64 {
     let id = scheduler::current_proc_id()
         .unwrap_or_else(|| fatal("EL0 syscall from a task that is not a userspace process"));
-    // Release the CSpace lock BEFORE any divergence (`exit_current` never returns).
-    let result = {
+    match inv.op {
+        // Cross-process IPC (AC7.2): rights-checked + block/deliver over the shared rendezvous.
+        op::ENDPOINT_CALL => ipc_call(id, inv),
+        op::ENDPOINT_RECV => ipc_recv(id, inv),
+        op::ENDPOINT_REPLY => ipc_reply(id, inv),
+        // DEBUG_EMIT / PROC_EXIT / the P6 ops — resolve + rights-check via the P6 dispatch, then
+        // apply the effect (a divergent exit cannot be expressed through the value-returning
+        // dispatch). Release the CSpace lock BEFORE any divergence (`exit_current` never returns).
+        _ => {
+            let result = {
+                let g = PROC_CSPACES.lock();
+                let cs = g[id]
+                    .as_ref()
+                    .unwrap_or_else(|| fatal("EL0 syscall before the process CSpace exists"));
+                crate::syscall::invoke(cs, inv)
+            };
+            match result {
+                Ok(v) => match inv.op {
+                    op::DEBUG_EMIT => {
+                        kprintln!("[praesidium] user: EL0 syscall DEBUG value={v:#x}");
+                        0
+                    }
+                    op::PROC_EXIT => {
+                        kprintln!("[praesidium] user: process exited (code {v})");
+                        retire(id, v);
+                    }
+                    _ => v,
+                },
+                Err(e) => {
+                    kprintln!("[praesidium] user: EL0 invocation refused ({e:?}) — killing the process, kernel survives");
+                    retire(id, u64::MAX);
+                }
+            }
+        }
+    }
+}
+
+/// RI check for an IPC op: resolve + rights-check the invoked cptr via the P6 dispatch. Kills the
+/// process (never returns) if the cap is missing/wrong — there is no ambient IPC authority.
+fn ipc_check(id: usize, inv: &Invocation) {
+    let check = {
         let g = PROC_CSPACES.lock();
         let cs = g[id]
             .as_ref()
-            .unwrap_or_else(|| fatal("EL0 syscall before the process CSpace exists"));
+            .unwrap_or_else(|| fatal("EL0 IPC before the process CSpace exists"));
         crate::syscall::invoke(cs, inv)
     };
-    match result {
-        Ok(v) => match inv.op {
-            op::DEBUG_EMIT => {
-                kprintln!("[praesidium] user: EL0 syscall DEBUG value={v:#x}");
-                0
-            }
-            op::PROC_EXIT => {
-                kprintln!("[praesidium] user: process exited (code {v})");
-                retire(id, v);
-            }
-            // A real capability op (CAP_IDENTIFY / FRAME_PROBE / ENDPOINT_SEND): return its result.
-            _ => v,
-        },
-        Err(e) => {
-            // A refusal from a (trusted) reference process is a bug. Fail closed — kill the process
-            // (the kernel survives), exactly as an unexpected fault would.
-            kprintln!("[praesidium] user: EL0 invocation refused ({e:?}) — killing the process, kernel survives");
-            retire(id, u64::MAX);
-        }
+    if let Err(e) = check {
+        kprintln!("[praesidium] user: EL0 IPC refused ({e:?}) — killing the process, kernel survives");
+        retire(id, u64::MAX);
     }
+}
+
+/// Cross-process CALL (AC7.2): rights-check SEND on the Endpoint, post the message to the shared
+/// rendezvous, and block (spin-yielding to the receiver) until the reply arrives; return the reply.
+fn ipc_call(id: usize, inv: &Invocation) -> u64 {
+    ipc_check(id, inv);
+    {
+        let mut r = EP_RDV.lock();
+        r.caller = Some(id);
+        r.msg = inv.args[0];
+        r.reply = None;
+    }
+    loop {
+        {
+            let mut r = EP_RDV.lock();
+            if let Some(v) = r.reply.take() {
+                r.caller = None;
+                return v;
+            }
+        }
+        scheduler::yield_now();
+    }
+}
+
+/// Cross-process RECV: rights-check RECV, block (spin-yielding) until a caller's message arrives,
+/// mint a single-use `Reply` cap naming the caller into this process's CSpace, and return the message.
+fn ipc_recv(id: usize, inv: &Invocation) -> u64 {
+    ipc_check(id, inv);
+    let (caller, msg) = loop {
+        {
+            let r = EP_RDV.lock();
+            if let Some(c) = r.caller {
+                break (c, r.msg);
+            }
+        }
+        scheduler::yield_now();
+    };
+    let mint = {
+        let mut g = PROC_CSPACES.lock();
+        g[id]
+            .as_mut()
+            .unwrap_or_else(|| fatal("EL0 RECV before the process CSpace exists"))
+            .mint_reply(REPLY_SLOT, caller as u64, 0)
+    };
+    if let Err(e) = mint {
+        kprintln!("[praesidium] user: RECV could not mint the Reply cap ({e:?}) — killing the process");
+        retire(id, u64::MAX);
+    }
+    msg
+}
+
+/// REPLY: consume the single-use `Reply` cap at the invoked cptr (CAP-REPLY-1) and deliver the reply
+/// word to the caller it names, unblocking the caller's CALL.
+fn ipc_reply(id: usize, inv: &Invocation) -> u64 {
+    let consumed = {
+        let mut g = PROC_CSPACES.lock();
+        g[id]
+            .as_mut()
+            .unwrap_or_else(|| fatal("EL0 REPLY before the process CSpace exists"))
+            .consume_reply(inv.cptr as usize)
+    };
+    if let Err(e) = consumed {
+        kprintln!("[praesidium] user: REPLY on a non-Reply/empty cptr ({e:?}) — killing the process");
+        retire(id, u64::MAX);
+    }
+    EP_RDV.lock().reply = Some(inv.args[0]);
+    0
 }
 
 /// Handle a userspace fault (an EL0 access that trapped — a bug or a hostile raw pointer). The
@@ -291,10 +402,11 @@ fn load_process(
     (loaded.entry, stack_va + PAGE as u64)
 }
 
-/// P7b (i.2): load the real `refproc` ping + pong `.pex` binaries and run them CONCURRENTLY at
-/// EL0/ring-3, each resolving its OWN capabilities via the per-Task CSpace binding. Both are loaded
-/// from ONE loader authority, so they share the one Endpoint (ping SEND, pong SEND+RECV) — the
-/// substrate for the cross-process IPC round-trip (AC7.2, i.3). Emits `PRAESIDIUM-P7B-I2-OK`.
+/// P7b (i.2/i.3): load the real `refproc` ping + pong `.pex` binaries and run them CONCURRENTLY at
+/// EL0/ring-3, each resolving its OWN capabilities via the per-Task CSpace binding. Both load from
+/// ONE loader authority, so they share the one Endpoint (ping SEND, pong SEND+RECV): ping CALLs a
+/// value, pong RECVs + REPLYs, ping gets the reply — a **cross-process capability IPC round-trip**
+/// (AC7.2) with no address-space swap (SASOS). Emits `PRAESIDIUM-P7B-I3-OK`.
 pub fn run_processes() {
     kprintln!("[praesidium] user: P7b — loading refproc ping + pong (real userspace binaries)");
     if !arch::el0_supported() {
@@ -337,5 +449,5 @@ pub fn run_processes() {
     if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 || PROC_EXIT[PONG].load(Ordering::Relaxed) != 0 {
         fatal("a refproc process did not exit cleanly");
     }
-    kprintln!("[praesidium] PRAESIDIUM-P7B-I2-OK");
+    kprintln!("[praesidium] PRAESIDIUM-P7B-I3-OK");
 }

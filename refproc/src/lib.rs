@@ -71,6 +71,30 @@ pub fn exit(code: u64) -> ! {
     }
 }
 
+/// The CSpace slot the kernel mints the single-use `Reply` capability into on [`recv`].
+pub const REPLY: u32 = 3;
+
+/// Cross-process CALL (AC7.2): send `msg` on the Endpoint and block for a one-word reply. The
+/// kernel rendezvous delivers it to whoever holds a `RECV` cap to the same Endpoint. Requires the
+/// process's Endpoint cap holds `SEND`.
+#[must_use]
+pub fn call(msg: u64) -> u64 {
+    invoke(EP, op::ENDPOINT_CALL, [msg, 0, 0, 0])
+}
+
+/// Cross-process RECV: block until a caller's [`call`] arrives, returning its message word. The
+/// kernel mints a single-use `Reply` capability at cptr [`REPLY`] for the ensuing [`reply`].
+/// Requires the process's Endpoint cap holds `RECV`.
+#[must_use]
+pub fn recv() -> u64 {
+    invoke(EP, op::ENDPOINT_RECV, [0, 0, 0, 0])
+}
+
+/// Reply `msg` to the blocked caller, consuming the single-use `Reply` cap at [`REPLY`].
+pub fn reply(msg: u64) {
+    let _ = invoke(REPLY, op::ENDPOINT_REPLY, [msg, 0, 0, 0]);
+}
+
 /// A panic in a reference process fails closed to `PROC_EXIT` with the sentinel error code — there
 /// is no serial or unwinding in userspace, so relinquishing the CPU is the only sane action.
 #[panic_handler]

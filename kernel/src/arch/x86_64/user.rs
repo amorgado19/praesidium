@@ -37,8 +37,11 @@ static KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 /// and one slot suffices.
 static USER_RSP: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes the syscall stub reserves for its saved register frame — 9 u64 slots, rounded up to a
-/// 16-byte multiple (so the `call` into the handler is ABI-aligned).
+/// Bytes the syscall stub reserves for its saved register frame — 10 u64 slots (selector/result,
+/// cptr, op, 4 args, user rip, user rflags, saved user rsp) = 0x50, exactly full. 0x50 is already
+/// a 16-byte multiple, so the `call` into the handler is ABI-aligned with no padding slack: there
+/// is NO spare slot — adding one requires growing this constant (else the write overruns the top
+/// of the task kernel stack).
 const SYSCALL_FRAME_BYTES: u64 = 0x50;
 
 /// Whether this backend can run ring-3 userspace. True: [`gdt_init`] runs at `interrupts_init`
@@ -46,6 +49,21 @@ const SYSCALL_FRAME_BYTES: u64 = 0x50;
 #[must_use]
 pub fn el0_supported() -> bool {
     true
+}
+
+/// Set the kernel stack the `syscall` fast path (KERNEL_RSP) and a ring3->ring0 trap (TSS.RSP0) land
+/// on — the CURRENT task's kernel stack. The scheduler calls this on switch-in to every task with a
+/// kernel stack, so two concurrent processes' syscalls each use their OWN kernel stack: x86
+/// `syscall` does not switch stacks, unlike aarch64's per-task-banked SP_EL1 (the aarch64 seam is a
+/// no-op).
+pub fn set_kernel_stack(top: u64) {
+    KERNEL_RSP.store(top, Ordering::Relaxed);
+    // SAFETY: TSS_RSP0 points at the leaked 'static TSS's privilege_stack_table[0], 4-byte aligned in
+    // the #[repr(C, packed(4))] TSS (unaligned write). The scheduler runs this preemption-masked on a
+    // single CPU, so no trap reads RSP0 mid-write.
+    unsafe {
+        (TSS_RSP0.load(Ordering::Relaxed) as *mut VirtAddr).write_unaligned(VirtAddr::new(top));
+    }
 }
 
 /// Build the GDT (ring-0 + ring-3 code/data) + a TSS, load them, reload the segment registers, and
@@ -107,21 +125,9 @@ pub fn gdt_init() {
 /// caller must be a scheduler task whose kernel stack can host the trap frames. [`gdt_init`] must
 /// have run.
 pub unsafe fn enter_user(entry: u64, user_sp: u64) -> ! {
-    // Capture this task's kernel RSP for the trap handlers: `syscall` does NOT switch stacks (the
-    // LSTAR stub reloads KERNEL_RSP), and a ring3->ring0 fault switches to TSS.RSP0. `enter_user`
-    // never returns, so the whole stack from here down is free for the handlers to reuse.
-    let ksp: u64;
-    // SAFETY: reading RSP is side-effect-free.
-    unsafe { asm!("mov {}, rsp", out(reg) ksp, options(nomem, nostack, preserves_flags)) };
-    KERNEL_RSP.store(ksp, Ordering::Relaxed);
-    // SAFETY: TSS_RSP0 holds &tss.privilege_stack_table[0] of the leaked 'static TSS. That field is
-    // only 4-byte aligned (TaskStateSegment is #[repr(C, packed(4))]), so use an UNALIGNED write — a
-    // typed 8-byte write there would be alignment UB. Single-CPU, and no trap reads RSP0 between here
-    // and the iretq-to-ring-3 below, so it cannot race.
-    unsafe {
-        (TSS_RSP0.load(Ordering::Relaxed) as *mut VirtAddr).write_unaligned(VirtAddr::new(ksp));
-    }
-
+    // The trap handlers' kernel stack (KERNEL_RSP for `syscall`, TSS.RSP0 for a ring3->ring0 fault)
+    // is set PER-TASK by the scheduler on switch-in ([`set_kernel_stack`]) — NOT here — so two
+    // concurrent processes' syscalls each land on their own kernel stack.
     let user_cs = USER_CS.load(Ordering::Relaxed);
     let user_ds = USER_DS.load(Ordering::Relaxed);
     // SAFETY: `user_ds` is a valid ring-3 data selector; DS/ES bases are ignored in 64-bit mode, so
@@ -177,8 +183,11 @@ global_asm!(
 .section .text
 .global praesidium_x86_syscall_entry
 praesidium_x86_syscall_entry:
-    mov [rip + {user_rsp}], rsp        // save user rsp
-    mov rsp, [rip + {kernel_rsp}]      // switch to this task's kernel stack
+    mov [rip + {user_rsp}], rsp        // TRANSIENT stash of the user rsp (moved into the frame below;
+                                       // no yield happens before that + IF is masked, so this global
+                                       // is safe as a single-entry transient even with 2 processes)
+    mov rsp, [rip + {kernel_rsp}]      // switch to the CURRENT task's kernel stack (set per-task by
+                                       // the scheduler on switch-in, so two processes never collide)
     and rsp, -16                       // 16-align (frame is a 16-multiple -> aligned at the call)
     sub rsp, {frame}
     mov [rsp + 0x00], rax              // selector (also the result slot)
@@ -190,19 +199,20 @@ praesidium_x86_syscall_entry:
     mov [rsp + 0x30], r9               // args[3]
     mov [rsp + 0x38], rcx              // user rip  (for sysretq)
     mov [rsp + 0x40], r11              // user rflags (for sysretq)
+    mov rax, [rip + {user_rsp}]        // reload the transiently-stashed user rsp
+    mov [rsp + 0x48], rax              // save it IN THE FRAME (per-process; survives a yield to a peer)
     mov rdi, rsp                       // frame ptr -> handler arg
     call {handler}
     mov rax, [rsp + 0x00]              // result -> rax
     mov rcx, [rsp + 0x38]              // user rip
     mov r11, [rsp + 0x40]              // user rflags
-    add rsp, {frame}
     xor edx, edx                       // zero the scratch regs we do not restore (no kernel leak)
     xor esi, esi
     xor edi, edi
     xor r8d, r8d
     xor r9d, r9d
     xor r10d, r10d
-    mov rsp, [rip + {user_rsp}]        // restore user rsp
+    mov rsp, [rsp + 0x48]              // restore user rsp FROM THE FRAME (per-process; last frame read)
     sysretq                            // -> ring 3: rip=rcx, rflags=r11, cs/ss (RPL 3) from STAR
 "#,
     user_rsp = sym USER_RSP,

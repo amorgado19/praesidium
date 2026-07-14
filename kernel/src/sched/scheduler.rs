@@ -188,12 +188,17 @@ fn schedule() {
         match s.pick_next() {
             Some(next) if next != from => {
                 s.current = next;
-                Some((s.ctx_ptr(from), s.ctx_ptr(next) as *const Context))
+                Some((s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, kernel_stack_top(s, next)))
             }
             _ => None,
         }
     });
-    if let Some((from_ptr, to_ptr)) = switch {
+    if let Some((from_ptr, to_ptr, ksp)) = switch {
+        // x86 `syscall` shares one kernel-RSP global, so point it (+ TSS.RSP0) at the incoming
+        // task's kernel stack BEFORE it runs — no-op on aarch64 (per-task-banked SP_EL1).
+        if let Some(top) = ksp {
+            arch::set_kernel_stack(top);
+        }
         // SAFETY: both pointers address stable boxed `Task` contexts that outlive the switch;
         // preemption is masked (single-CPU exclusion) so no concurrent code mutates them, and
         // `to` was primed by context_init or a prior switch. Control resumes here when this task
@@ -201,6 +206,15 @@ fn schedule() {
         unsafe { arch::context_switch(from_ptr, to_ptr) };
     }
     arch::preempt_restore(prev);
+}
+
+/// The (exclusive) top of task `i`'s kernel stack, or `None` for the bootstrap/idle task (which
+/// runs on the kernel `BOOT_STACK` and never syscalls from ring 3). Used to point the x86 syscall
+/// kernel stack at the incoming task on each switch.
+fn kernel_stack_top(s: &Scheduler, i: usize) -> Option<u64> {
+    s.tasks[i]
+        .stack_phys
+        .map(|block| memory::phys_to_virt(block) + BLOCK_BYTES as u64)
 }
 
 /// The generic launcher a new task's stack `ret`s into (via the arch trampoline) the first time
@@ -235,13 +249,18 @@ fn task_exit() -> ! {
             s.pick_next().map(|next| {
                 let from = s.current;
                 s.current = next;
-                (s.ctx_ptr(from), s.ctx_ptr(next) as *const Context)
+                (s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, kernel_stack_top(s, next))
             })
         });
         match switch {
             // SAFETY: as in `schedule`; this finished task is never resumed, so the outgoing
             // context save is discarded — that is fine, its stack is abandoned.
-            Some((from_ptr, to_ptr)) => unsafe { arch::context_switch(from_ptr, to_ptr) },
+            Some((from_ptr, to_ptr, ksp)) => {
+                if let Some(top) = ksp {
+                    arch::set_kernel_stack(top);
+                }
+                unsafe { arch::context_switch(from_ptr, to_ptr) }
+            }
             None => {
                 // Nothing else to run: park until the next interrupt (which may wake a task).
                 arch::wait_for_interrupt();

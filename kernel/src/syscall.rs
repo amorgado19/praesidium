@@ -72,6 +72,28 @@ pub fn invoke<const N: usize>(cs: &CSpace<N>, inv: &Invocation) -> Result<u64, I
             Ok(inv.args[0])
         }
 
+        // Cross-process IPC rights-check (P7b AC7.2): CALL needs SEND, RECV needs RECV on an
+        // Endpoint. The rendezvous EFFECT (block/deliver/reply) is the caller's (kernel::user),
+        // just as DEBUG_EMIT's console write is — this dispatch only resolves + rights-checks (RI).
+        op::ENDPOINT_CALL => {
+            if cap.cap_type != CapType::Endpoint {
+                return Err(InvokeError::WrongType);
+            }
+            if !cap.rights.contains(Rights::SEND) {
+                return Err(InvokeError::InsufficientRights);
+            }
+            Ok(cap.badge)
+        }
+        op::ENDPOINT_RECV => {
+            if cap.cap_type != CapType::Endpoint {
+                return Err(InvokeError::WrongType);
+            }
+            if !cap.rights.contains(Rights::RECV) {
+                return Err(InvokeError::InsufficientRights);
+            }
+            Ok(cap.badge)
+        }
+
         _ => Err(InvokeError::UnknownOp),
     }
 }

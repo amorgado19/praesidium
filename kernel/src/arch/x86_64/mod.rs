@@ -18,7 +18,7 @@ pub use paging::{
     install_guard_page, map_page, map_user_page, page_prot, sync_instruction_cache, translate,
 };
 pub use timer::timer_init;
-pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user};
+pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user, set_kernel_stack};
 
 /// The `.pex` architecture tag for this backend (ADR-0006): a `.pex`'s segments are native code,
 /// so the loader only accepts images tagged for the arch it runs on. Behind the seam so nothing

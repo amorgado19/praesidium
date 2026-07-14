@@ -249,13 +249,13 @@ const USER_REQUIRED: &[&str] = &[
     "process exited (code 0)",        // clean exit via a capability invocation
     "EL0 fault CONTAINED",            // an EL0 raw read of a supervisor page killed the process, kernel survived
     "PRAESIDIUM-P7A-OK",
-    // P7b (i.2): TWO REAL refproc binaries (ping + pong), loaded + run concurrently at EL0, each
-    // resolving its own caps via the per-Task CSpace binding.
+    // P7b (i.3): TWO REAL refproc binaries do a CROSS-PROCESS capability IPC round-trip (AC7.2) —
+    // ping CALLs 0xcafe over the shared Endpoint; pong RECVs it + REPLYs 0xcaff; ping gets the reply.
     "ping.pex loaded",                    // the loader accepted the real .pex + minted its manifest caps
     "pong.pex loaded",
-    "EL0 syscall DEBUG value=0x50494e47", // ping ("PING") ran real native code + a capability-mediated syscall
-    "EL0 syscall DEBUG value=0x504f4e47", // pong ("PONG")
-    "PRAESIDIUM-P7B-I2-OK",
+    "EL0 syscall DEBUG value=0xcafe",     // pong received ping's message over the shared capability Endpoint
+    "EL0 syscall DEBUG value=0xcaff",     // ping got pong's reply (the round-trip closed)
+    "PRAESIDIUM-P7B-I3-OK",
 ];
 
 const SCENARIOS: &[Scenario] = &[
@@ -311,7 +311,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "user",
         required: USER_REQUIRED,
         forbidden: FORBIDDEN,
-        success: "PRAESIDIUM-P7B-I2-OK",
+        success: "PRAESIDIUM-P7B-I3-OK",
     },
 ];
 

@@ -51,6 +51,12 @@ pub fn el0_supported() -> bool {
     true
 }
 
+/// Set the current task's kernel stack for the syscall/fault path — a **no-op on aarch64**: the
+/// trap uses the per-task-banked `SP_EL1` (the kernel SP that `context_switch` swaps), so it is
+/// already per-task without a global. The x86 seam needs the real thing (its `syscall` shares one
+/// kernel-RSP global). The scheduler calls this on every switch-in.
+pub fn set_kernel_stack(_top: u64) {}
+
 extern "C" {
     static praesidium_el0_blob: u8;
     static praesidium_el0_blob_end: u8;

@@ -88,7 +88,7 @@ pub use x86_64::{
     halt,
     install_guard_page, interrupts_init, map_page, map_user_page, memory_barrier, page_prot,
     preempt_disable, preempt_enable, preempt_restore, read_translation_root, serial_init,
-    serial_write_byte, sync_instruction_cache, timer_init, translate, wait_for_interrupt, Context,
+    serial_write_byte, set_kernel_stack, sync_instruction_cache, timer_init, translate, wait_for_interrupt, Context,
     PEX_ARCH,
 };
 
@@ -101,7 +101,7 @@ pub use aarch64::{
     halt,
     install_guard_page, interrupts_init, map_page, map_user_page, memory_barrier, page_prot,
     preempt_disable, preempt_enable, preempt_restore, read_translation_root, serial_init,
-    serial_write_byte, sync_instruction_cache, timer_init, translate, wait_for_interrupt, Context,
+    serial_write_byte, set_kernel_stack, sync_instruction_cache, timer_init, translate, wait_for_interrupt, Context,
     PEX_ARCH,
 };
 

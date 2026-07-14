@@ -6,8 +6,12 @@
 #![no_main]
 
 /// Process entry — see [`ping`](../ping/index.html). Dropped to at EL0/ring-3 with GPRs zeroed.
+/// pong is the IPC SERVER: it RECVs a message over the shared capability Endpoint, logs it, and
+/// REPLYs `msg + 1` (consuming the single-use Reply cap) — the round-trip's other half (AC7.2).
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    refproc::debug(0x504F_4E47); // "PONG"
+    let msg = refproc::recv(); // block for ping's CALL
+    refproc::debug(msg); // the received message (0xcafe)
+    refproc::reply(msg.wrapping_add(1)); // reply 0xcaff to ping, consuming the Reply cap
     refproc::exit(0)
 }
