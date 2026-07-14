@@ -32,6 +32,14 @@ pub use paging::{
 pub fn isolation_mechanism() -> &'static str {
     "aarch64 FEAT_MTE tag-check (ADR-0008 DEC-0008-3)"
 }
+
+/// Arm the process-vs-process isolation mechanism before userspace runs (P7b-ii). On aarch64 this
+/// enables synchronous EL0+EL1 MTE tag checking + the Tagged MAIR attr ([`mte::enable`]) so the
+/// per-process granule tags set by [`paging::map_user_page`] are enforced. Harmless before any
+/// tagged page exists (the kernel's own pages are untagged). x86 arms PKU earlier (at `gdt_init`).
+pub fn isolation_init() {
+    mte::enable();
+}
 pub use timer::timer_init;
 
 /// Mask IRQs (disable preemption), returning whether they were enabled before — pass that back

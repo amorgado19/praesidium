@@ -31,6 +31,11 @@ pub fn isolation_mechanism() -> &'static str {
         "x86 per-domain page tables (fallback, ADR-0008 DEC-0008-6)"
     }
 }
+
+/// Arm the process-vs-process isolation mechanism before userspace runs (P7b-ii). On x86 PKU is
+/// already armed at [`user::gdt_init`] (it must precede the ring-3 machinery), so this is a no-op —
+/// kept to mirror the aarch64 seam, where MTE is enabled here.
+pub fn isolation_init() {}
 pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user, set_kernel_stack};
 
 /// The `.pex` architecture tag for this backend (ADR-0006): a `.pex`'s segments are native code,

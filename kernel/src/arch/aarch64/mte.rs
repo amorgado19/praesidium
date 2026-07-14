@@ -21,16 +21,18 @@ fn with_tag(addr: u64, tag: u8) -> u64 {
     (addr & !(0xf << 56)) | ((u64::from(tag) & 0xf) << 56)
 }
 
-/// Enable synchronous EL1 MTE tag checking and install the Normal-Tagged memory attribute at
-/// `MAIR` index 2 — idempotent (safe to call more than once). Read-modify-write throughout so
-/// only the MTE-relevant bits change:
+/// Enable synchronous MTE tag checking at **both EL1 (P5b) and EL0 (P7b-ii)** and install the
+/// Normal-Tagged memory attribute at `MAIR` index 2 — idempotent (safe to call more than once).
+/// Read-modify-write throughout so only the MTE-relevant bits change:
 ///  - `MAIR_EL1[byte 2] = 0xF0` — Normal Inner/Outer WB, **Tagged** (leaves attr0/attr1 intact).
-///  - `TCR_EL1.TBI1 = 1` — top-byte-ignore for the TTBR1 (high-half/HHDM) region, so bits [59:56]
-///    are the pointer's logical tag rather than translated address (existing high-half pointers,
-///    whose top byte is the sign extension, still translate identically). `TCMA1 = 0` so tag 0
-///    is *not* exempt from checking.
-///  - `SCTLR_EL1.ATA = 1` (EL1 allocation-tag access) and `TCF = 0b01` (synchronous tag-check
-///    faults at EL1).
+///  - `TCR_EL1.TBI1/TBI0 = 1` — top-byte-ignore for the TTBR1 (high-half/HHDM) AND TTBR0 (low-half/
+///    userspace) regions, so bits [59:56] are the pointer's logical tag rather than translated
+///    address (existing pointers, whose top byte is the sign extension / zero, still translate
+///    identically). `TCMA1 = TCMA0 = 0` so tag 0 is *not* exempt — a raw tag-0 pointer into a tagged
+///    region faults (the P7b-ii red-team: a hostile process forms an untagged cross-domain pointer).
+///  - `SCTLR_EL1.ATA/ATA0 = 1` (EL1+EL0 allocation-tag access) and `TCF/TCF0 = 0b01` (synchronous
+///    tag-check faults at EL1 and EL0). An EL0 tag-check fault surfaces as a Data Abort (EC 0x24),
+///    which the EL0 trap handler already routes to killing the process.
 ///
 /// The translation-affecting writes (MAIR/TCR) are made coherent with a `tlbi`+`isb` before the
 /// `SCTLR` write arms checking, and before any tagged access follows (explicit barriers, DEC-0007-4).
@@ -49,10 +51,14 @@ pub fn enable() {
         );
     }
     mair = (mair & !(0xffu64 << 16)) | (0xf0u64 << 16); // attr2 = Normal WB Tagged
-    tcr |= 1u64 << 38; // TBI1
-    tcr &= !(1u64 << 58); // TCMA1 = 0 (tag 0 is still checked)
+    tcr |= 1u64 << 38; // TBI1 (top-byte-ignore, TTBR1/high half — EL1 pointer tags)
+    tcr &= !(1u64 << 58); // TCMA1 = 0 (tag 0 is still checked at EL1)
+    tcr |= 1u64 << 37; // TBI0 (top-byte-ignore, TTBR0/low half — EL0/userspace pointer tags, P7b-ii)
+    tcr &= !(1u64 << 57); // TCMA0 = 0 (tag 0 is still checked at EL0 — a tag-0 raw pointer faults)
     sctlr |= 1u64 << 43; // ATA (EL1 allocation-tag access)
-    sctlr = (sctlr & !(0b11u64 << 40)) | (0b01u64 << 40); // TCF = synchronous
+    sctlr = (sctlr & !(0b11u64 << 40)) | (0b01u64 << 40); // TCF = synchronous (EL1 tag-check faults)
+    sctlr |= 1u64 << 42; // ATA0 (EL0 allocation-tag access, P7b-ii)
+    sctlr = (sctlr & !(0b11u64 << 38)) | (0b01u64 << 38); // TCF0 = synchronous (EL0 tag-check faults)
 
     // SAFETY: installs an unused MAIR attr (attr2) + TBI1 (does not change existing translations)
     // + EL1 tag checking, preserving all other control bits. The tlbi+isb make the MAIR/TCR
@@ -75,6 +81,35 @@ pub fn enable() {
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// Set every 16-byte allocation-tag granule of the 4 KiB page at `hhdm_base` to `tag` (P7b-ii). The
+/// page MUST already be a **writable Normal-Tagged** mapping the kernel owns — the frame's HHDM
+/// alias remapped via [`super::paging::map_tagged`] — since `STG` writes tag memory (needs write
+/// permission + `SCTLR.ATA`). Setting the physical granule tags here makes an EL0 access through the
+/// *user* alias (also Normal-Tagged) tag-checked against `tag`: a matching-tag pointer reads it, a
+/// tag-0 (or foreign-tag) raw pointer faults. The tag storage is per physical granule, so which
+/// alias sets it is immaterial. Barriers order the tag stores before any subsequent tagged access.
+pub fn tag_frame(hhdm_base: u64, tag: u8) {
+    let base = with_tag(hhdm_base & !0xfff, tag);
+    for g in 0..256u64 {
+        // 4096 / 16 = 256 granules per page.
+        let p = base + g * 16;
+        // SAFETY: `STG` sets the allocation tag of the 16-byte granule at `[p]` to `p`'s logical tag
+        // (`tag`); `p` lies within a writable Normal-Tagged page the kernel owns. It reads/writes no
+        // data, only tag memory. `.arch_extension memtag` lets the assembler accept STG on soft-float.
+        unsafe {
+            asm!(
+                ".arch_extension memtag",
+                "stg {p}, [{p}]",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    // SAFETY: order the tag stores (to tag memory) before the granules are accessed through any
+    // alias — the explicit barrier seam (DEC-0007-4).
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
 }
 
 /// Isolation Layer-2 escape red-team (P5b, DEC-0008-7): tag a victim granule to one domain, then

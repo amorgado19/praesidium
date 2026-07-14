@@ -9,13 +9,22 @@ use core::arch::{asm, global_asm};
 
 use abi::invoke::{sys, Invocation, MSG_REGS};
 
-/// Drop to EL0 at `entry` with user stack `user_sp`. Never returns: the process runs until it
-/// exits (a syscall) or faults, each of which retires its scheduler task and schedules away.
+/// Drop to EL0 at `entry` with user stack `user_sp`, in isolation `domain` (P7b-ii). Never returns:
+/// the process runs until it exits (a syscall) or faults, each of which retires its scheduler task
+/// and schedules away.
+///
+/// The `domain`'s 4-bit tag is placed in the top byte of the banked user SP (`SP_EL0`), so the
+/// process's stack accesses (SP-relative) carry the domain's MTE tag and match its Normal-Tagged,
+/// domain-tagged stack granules (TBI0 makes the tag byte ignored for translation). A peer forming a
+/// tag-0 raw pointer to this stack therefore tag-faults. Domain 0 leaves SP untagged (the P7a
+/// single-process bring-up, which needs no process-vs-process isolation and maps untagged pages).
 ///
 /// # Safety
 /// `entry` must map EL0-executable code and `user_sp` an EL0-writable, 16-aligned stack. The
 /// caller must be a scheduler task whose kernel stack (SP_EL1) can host the trap frames.
-pub unsafe fn enter_user(entry: u64, user_sp: u64) -> ! {
+pub unsafe fn enter_user(entry: u64, user_sp: u64, domain: u64) -> ! {
+    // Tag the banked user SP with the process's domain (top byte; TBI0 ignores it for translation).
+    let sp = user_sp | ((domain & 0xf) << 56);
     // Initial-register ABI: a process starts at EL0 with EVERY general-purpose register zero, so no
     // live kernel value (a pointer, a stack address) leaks across the privilege drop. The process
     // sets up its own registers from zero. SPSR for EL0t (`M[3:0]=0`) with D/A/I/F masked: the P7a
@@ -37,7 +46,7 @@ pub unsafe fn enter_user(entry: u64, user_sp: u64) -> ! {
             "mov x24, xzr", "mov x25, xzr", "mov x26, xzr", "mov x27, xzr",
             "mov x28, xzr", "mov x29, xzr", "mov x30, xzr",
             "eret",
-            sp = in(reg) user_sp,
+            sp = in(reg) sp,
             entry = in(reg) entry,
             spsr = in(reg) 0x3c0u64, // D,A,I,F = 1 ; M = EL0t
             options(noreturn),

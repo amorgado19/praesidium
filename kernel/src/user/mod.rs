@@ -82,6 +82,10 @@ const PAGE: usize = 4096;
 pub const EP_SLOT: Cptr = 1;
 const EP_BADGE: u64 = 0xB1;
 const AUTH_SLOTS: usize = 4;
+/// Isolation domain for the P7a bring-up process: 0 (untagged / PKU key 0). P7a is single-process
+/// and Fork-A-independent — it needs no process-vs-process isolation, and the P7b isolation
+/// mechanism ([`arch::isolation_init`]) is armed only when [`run_processes`] runs, after P7a.
+const P7A_DOMAIN: u64 = 0;
 
 // ---- P7b reference processes (real .pex, embedded by xtask) ----
 const PING_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PING_PEX"));
@@ -324,7 +328,7 @@ fn run_el0_process(blob: &[u8], id: usize, domain: u64, code_phys: u64, code_va:
     scheduler::spawn_proc(
         // SAFETY: `code_va` maps EL0-executable code (entry at offset 0) and `stack_top` the top of
         // an EL0-writable stack page.
-        move || unsafe { arch::enter_user(code_va, stack_top) },
+        move || unsafe { arch::enter_user(code_va, stack_top, domain) },
         Budget::new(u32::MAX, u32::MAX),
         id,
         domain,
@@ -351,7 +355,7 @@ pub fn run() {
     let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for user stack"));
 
     // (1) Capability-mediated transport: DEBUG_EMIT then PROC_EXIT, each resolved + rights-checked.
-    run_el0_process(arch::el0_test_blob(), PING, DOMAIN_PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
+    run_el0_process(arch::el0_test_blob(), PING, P7A_DOMAIN, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
     if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 {
         fatal("bring-up process did not exit cleanly");
     }
@@ -364,7 +368,7 @@ pub fn run() {
     unsafe {
         arch::map_page(FAULT_PROBE_VA, probe_phys, arch::Prot::Ro);
     }
-    run_el0_process(arch::el0_fault_blob(), PING, DOMAIN_PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
+    run_el0_process(arch::el0_fault_blob(), PING, P7A_DOMAIN, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
     if PROC_EXIT[PING].load(Ordering::Relaxed) != u64::MAX {
         fatal("fault process was not killed by the EL0 fault path");
     }
@@ -421,6 +425,10 @@ pub fn run_processes() {
         return;
     }
 
+    // Arm the process-vs-process isolation mechanism BEFORE any process page is mapped/tagged
+    // (aarch64 enables MTE tag checking here; x86 armed PKU earlier at gdt_init). P7b-ii.
+    arch::isolation_init();
+
     // Both processes load from ONE authority (so they share the one Endpoint) with a SHARED scratch
     // cursor that advances across loads — each load's retyped segment-frame cap stays in the
     // authority, so a reset base would collide (LOADER_SLOTS=32 holds both processes' scratch).
@@ -443,14 +451,14 @@ pub fn run_processes() {
     scheduler::spawn_proc(
         // SAFETY: `ping_entry` is loader-mapped EL0-executable code; `ping_sp` the top of ping's
         // EL0-writable stack page.
-        move || unsafe { arch::enter_user(ping_entry, ping_sp) },
+        move || unsafe { arch::enter_user(ping_entry, ping_sp, DOMAIN_PING) },
         Budget::new(u32::MAX, u32::MAX),
         PING,
         DOMAIN_PING,
     );
     scheduler::spawn_proc(
         // SAFETY: as above, for pong.
-        move || unsafe { arch::enter_user(pong_entry, pong_sp) },
+        move || unsafe { arch::enter_user(pong_entry, pong_sp, DOMAIN_PONG) },
         Budget::new(u32::MAX, u32::MAX),
         PONG,
         DOMAIN_PONG,

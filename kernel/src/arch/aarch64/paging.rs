@@ -355,11 +355,33 @@ fn user_page_desc(pa: u64, prot: Prot) -> u64 {
 /// `vaddr` must be a page in the process's reserved VA window the caller controls; `phys` a frame
 /// the caller owns. Overwrites any existing mapping of `vaddr`.
 pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot, domain: u64) {
-    let _ = domain; // aarch64 MTE domain-tagging is wired in the aarch64-MTE increment (task #16)
     let v = vaddr & !0xfff;
+    let pa = phys & ADDR_MASK;
     let l3 = ensure_l3_table(v);
-    write_entry(l3, lidx(v, 3), user_page_desc(phys & ADDR_MASK, prot));
+    // P7b-ii: a process page in a non-zero isolation domain is mapped **Normal-Tagged** and its
+    // granule allocation tags are set to the domain — so an EL0 access through this user VA is
+    // MTE-checked against the domain tag; a peer's tag-0 raw pointer faults (the CAP-MEM-3 payoff
+    // within one address space). Domain 0 = untagged (the P7a single-process bring-up needs no
+    // process-vs-process isolation). MTE must already be armed ([`super::mte::enable`]).
+    let tagged = domain != 0;
+    let desc = if tagged {
+        (user_page_desc(pa, prot) & !(0b111 << 2)) | ATTR_TAGGED // AttrIndx 0 (Normal) -> 2 (Tagged)
+    } else {
+        user_page_desc(pa, prot)
+    };
+    write_entry(l3, lidx(v, 3), desc);
     flush_page(v);
+    if tagged {
+        let hhdm = phys_to_virt(pa);
+        // SAFETY: `hhdm` is this frame's writable HHDM alias we own; remap it Normal-Tagged so STG can
+        // write the granule tags = `domain`. The kernel reaches process frames only via the HHDM, and
+        // this frame is not freed in bring-up, so leaving the alias Tagged is sound (a future frame
+        // reaper MUST restore ATTR_NORMAL before returning it, else a tag-0 HHDM access would fault).
+        unsafe {
+            map_tagged(hhdm);
+        }
+        super::mte::tag_frame(hhdm, (domain & 0xf) as u8);
+    }
 }
 
 /// Program the isolation domain for the task the scheduler is switching in (P7b-ii). On aarch64 the

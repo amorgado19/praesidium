@@ -130,7 +130,11 @@ pub fn gdt_init() {
 /// `entry` must map ring-3-executable code and `user_sp` a ring-3-writable, 16-aligned stack. The
 /// caller must be a scheduler task whose kernel stack can host the trap frames. [`gdt_init`] must
 /// have run.
-pub unsafe fn enter_user(entry: u64, user_sp: u64) -> ! {
+pub unsafe fn enter_user(entry: u64, user_sp: u64, domain: u64) -> ! {
+    // `domain` (the PKU key) is not applied here on x86: the scheduler programs PKRU per-task on
+    // switch-in ([`super::pku::set_domain`]), and a ring-3 stack pointer must stay canonical (no tag
+    // byte), unlike aarch64's tagged SP_EL0. Accepted to keep the seam identical across arches.
+    let _ = domain;
     // The trap handlers' kernel stack (KERNEL_RSP for `syscall`, TSS.RSP0 for a ring3->ring0 fault)
     // is set PER-TASK by the scheduler on switch-in ([`set_kernel_stack`]) — NOT here — so two
     // concurrent processes' syscalls each land on their own kernel stack.
