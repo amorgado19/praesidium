@@ -90,19 +90,24 @@ const P7A_DOMAIN: u64 = 0;
 // ---- P7b reference processes (real .pex, embedded by xtask) ----
 const PING_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PING_PEX"));
 const PONG_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PONG_PEX"));
+/// The HOSTILE red-team binary (P7b-ii / AC7.3): raw-reads pong's segment VA.
+const EVIL_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_EVIL_PEX"));
 /// User-stack VAs (one page each), distinct from the processes' segments (ping @ 0x4010_0000, pong
-/// @ 0x4030_0000) and each other — all inside the reserved window [1 GiB, 2 GiB).
+/// @ 0x4030_0000, evil @ 0x4050_0000) and each other — all inside the reserved window [1 GiB, 2 GiB).
 const PING_STACK_VA: u64 = 0x4020_0000;
 const PONG_STACK_VA: u64 = 0x4040_0000;
+const EVIL_STACK_VA: u64 = 0x4060_0000;
 /// Isolation domains (P7b-ii): the small non-zero value used as each process's PKU protection key
 /// (x86, PTE bits [62:59]) and MTE tag (aarch64). Key 0 is the kernel/default domain, so processes
 /// start at 1. A process's `PKRU` (set on switch-in) allows ONLY its own key, so a raw read of a
 /// peer's page faults — the CAP-MEM-3 payoff within one address space.
 const DOMAIN_PING: u64 = 1;
 const DOMAIN_PONG: u64 = 2;
+const DOMAIN_EVIL: u64 = 3;
 /// Process indices — a process's scheduler `proc_id` and its registry slot.
 const PING: usize = 0;
 const PONG: usize = 1;
+const EVIL: usize = 2;
 
 fn fatal(msg: &str) -> ! {
     kprintln!("[praesidium] FATAL: user: {msg}");
@@ -472,4 +477,50 @@ pub fn run_processes() {
         fatal("a refproc process did not exit cleanly");
     }
     kprintln!("[praesidium] PRAESIDIUM-P7B-I3-OK");
+
+    // ---- AC7.3 red-team: a HOSTILE .pex raw-reads pong's memory. The isolation backstop must fault
+    // it, the kernel kills it, and ping/pong + the kernel survive. The existential proof (CAP-MEM-3).
+    run_redteam(&mut loader, &mut scratch);
+}
+
+/// P7b-ii red-team (AC7.3): load the hostile `evil` `.pex` in its OWN isolation domain and run it. It
+/// forms a raw pointer to `pong`'s segment VA — memory it holds NO capability for — and reads it. The
+/// hardware backstop (x86 PKU / aarch64 MTE) must fault the read; the kernel kills `evil` via the EL0
+/// fault path (no new wiring — a PKU `#PF` / MTE Data Abort routes there like any EL0 fault). We
+/// assert `evil` was KILLED (a clean exit would mean the read SUCCEEDED — a breach — and fails
+/// closed + loud) and that the kernel ran on to here. `pong`'s pages remain mapped after it exited
+/// (no reaper yet), so the target is live. This is the CAP-MEM-3 payoff against a REAL hostile
+/// native binary — distinct from P5b's *armed* in-kernel proof. Emits `PRAESIDIUM-P7B-II-OK`.
+fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr) {
+    kprintln!(
+        "[praesidium] user: P7b-ii AC7.3 red-team — loading HOSTILE evil.pex (it raw-reads pong's memory at {:#x})",
+        PONG_STACK_VA - 0x10_0000 // pong's segment base 0x4030_0000 (see evil::VICTIM_VA)
+    );
+    let (evil_entry, evil_sp) =
+        load_process(loader, scratch, EVIL_PEX, DOMAIN_EVIL, EVIL, EVIL_STACK_VA, "evil");
+
+    PROC_DONE[EVIL].store(false, Ordering::Release);
+    PROC_EXIT[EVIL].store(0, Ordering::Relaxed);
+    scheduler::spawn_proc(
+        // SAFETY: `evil_entry` is loader-mapped EL0-executable code; `evil_sp` the top of evil's
+        // EL0-writable stack page.
+        move || unsafe { arch::enter_user(evil_entry, evil_sp, DOMAIN_EVIL) },
+        Budget::new(u32::MAX, u32::MAX),
+        EVIL,
+        DOMAIN_EVIL,
+    );
+    while !PROC_DONE[EVIL].load(Ordering::Acquire) {
+        scheduler::yield_now();
+    }
+
+    // evil MUST have been KILLED (`u64::MAX`) by the isolation fault. A clean exit means the raw
+    // cross-domain read RETURNED — isolation FAILED (a breach). Fail closed + loud.
+    if PROC_EXIT[EVIL].load(Ordering::Relaxed) != u64::MAX {
+        fatal("AC7.3 BREACH — a hostile process read another domain's memory; ISOLATION FAILED");
+    }
+    kprintln!(
+        "[praesidium] user: AC7.3 isolation red-team CONTAINED — hostile cross-domain raw read faulted; evil KILLED by {}; ping+pong+kernel survive (CAP-MEM-3 payoff vs a real native binary)",
+        arch::isolation_mechanism()
+    );
+    kprintln!("[praesidium] PRAESIDIUM-P7B-II-OK");
 }

@@ -32,6 +32,13 @@ path = "src/ping.rs"
 name = "pong"
 path = "src/pong.rs"
 
+# The P7b-ii isolation red-team (AC7.3): a HOSTILE native binary that raw-reads another process's
+# memory. The hardware backstop (PKU/MTE) must fault the read so the kernel kills it — proving
+# process-vs-process isolation against a real adversary, not a well-behaved component.
+[[bin]]
+name = "evil"
+path = "src/evil.rs"
+
 [dependencies]
 abi = { path = "../abi" } # userspace touches the kernel ONLY through the ABI
 

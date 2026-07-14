@@ -261,6 +261,11 @@ const USER_REQUIRED: &[&str] = &[
     "EL0 syscall DEBUG value=0xcafe",     // pong received ping's message over the shared capability Endpoint
     "EL0 syscall DEBUG value=0xcaff",     // ping got pong's reply (the round-trip closed)
     "PRAESIDIUM-P7B-I3-OK",
+    // P7b-ii (AC7.3): the isolation RED-TEAM — a hostile native .pex raw-reads pong's memory; the
+    // hardware backstop (PKU/MTE) faults the read, the kernel kills evil, ping+pong+kernel survive.
+    "isolation armed",                    // per-process domains assigned (PKU keys / MTE tags)
+    "AC7.3 isolation red-team CONTAINED", // the hostile cross-domain raw read faulted; evil killed
+    "PRAESIDIUM-P7B-II-OK",
 ];
 
 const SCENARIOS: &[Scenario] = &[
@@ -324,7 +329,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "user",
         required: USER_REQUIRED,
         forbidden: FORBIDDEN,
-        success: "PRAESIDIUM-P7B-I3-OK",
+        success: "PRAESIDIUM-P7B-II-OK",
         // The isolation-carrying scenario: force TCG + `-cpu max` on x86 so PKU is emulated
         // deterministically (host-/KVM-independent), guaranteeing the PKU isolation primary is
         // exercised every run — not silently replaced by the fallback under a no-KVM CI.
@@ -471,6 +476,9 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     // space; both share ONE Endpoint (the loader derives each cap from one authority) for AC7.2 IPC.
     let ping_pex = build_refproc(arch, "ping", "send", "0x91", None)?;
     let pong_pex = build_refproc(arch, "pong", "sendrecv", "0x92", Some("0x40300000"))?;
+    // P7b-ii red-team: the HOSTILE `evil` binary at its own base — raw-reads pong's segment
+    // (0x40300000). It holds an Endpoint (SEND) only to report a breach; the read must fault first.
+    let evil_pex = build_refproc(arch, "evil", "send", "0x93", Some("0x40500000"))?;
 
     eprintln!(
         "[xtask] building kernel for {} ({})",
@@ -478,9 +486,10 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     );
     let status = Command::new(&cargo)
         .current_dir(&root)
-        // The kernel `include_bytes!(env!("PRAESIDIUM_{PING,PONG}_PEX"))` the packaged refproc images.
+        // The kernel `include_bytes!(env!("PRAESIDIUM_{PING,PONG,EVIL}_PEX"))` the packaged images.
         .env("PRAESIDIUM_PING_PEX", &ping_pex)
         .env("PRAESIDIUM_PONG_PEX", &pong_pex)
+        .env("PRAESIDIUM_EVIL_PEX", &evil_pex)
         .args([
             "build",
             // build-std is passed here (not in .cargo/config.toml) so it applies only to the

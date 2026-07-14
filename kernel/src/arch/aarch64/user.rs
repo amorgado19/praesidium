@@ -151,7 +151,10 @@ pub extern "C" fn el0_sync_handler(frame: *mut u64) {
             options(nomem, nostack, preserves_flags),
         );
     }
-    match esr >> 26 {
+    // Exception Class is ESR_EL1[31:26] — mask to 6 bits: some faults (e.g. an MTE synchronous
+    // tag-check Data Abort under `-cpu max`) leave bits [63:32] set, so an unmasked `esr >> 26`
+    // would mis-decode a valid EC (a permission fault happens to have clean high bits — luck).
+    match (esr >> 26) & 0x3f {
         0x15 => {
             // SVC from aarch64. Register ABI (behind the ADR-0007 seam): x8 = syscall selector; for
             // the only selector (sys::INVOKE) x0 = cptr, x1 = op, x2..x5 = args. Everything is a
