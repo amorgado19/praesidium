@@ -365,13 +365,22 @@ fn ensure_pt_user(v: u64) -> u64 {
 /// place a userspace process's segments so ring 3 can reach them, while the kernel/HHDM stay
 /// supervisor-only (a ring-3 raw pointer into kernel memory faults on the supervisor-only leaf).
 ///
+/// `domain` is the process's isolation domain (P7b-ii): its low 4 bits become the page's PKU
+/// **protection key** (PTE bits [62:59]), so — with `CR4.PKE` on and a per-process `PKRU` set on
+/// switch-in ([`super::pku`]) — a *different* process's raw read of this page takes a PK `#PF`.
+/// The key bits are ignored by hardware when PKU is absent, so tagging is harmless on the fallback.
+///
 /// # Safety
 /// `vaddr` must be a page in the process's reserved VA window the caller controls; `phys` a frame
 /// the caller owns. Overwrites any existing mapping of `vaddr`.
-pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot) {
+pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot, domain: u64) {
     let v = vaddr & !0xfff;
     let pt = ensure_pt_user(v);
-    write_entry(pt, idx(v, 0), (phys & ADDR_MASK) | leaf_bits(prot) | USER);
+    write_entry(
+        pt,
+        idx(v, 0),
+        (phys & ADDR_MASK) | leaf_bits(prot) | USER | super::pku::pkey_bits(domain),
+    );
     invlpg(v);
 }
 

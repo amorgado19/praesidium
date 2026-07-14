@@ -60,6 +60,11 @@ struct Task {
     /// against the CURRENT process's CSpace — the per-Task binding that generalises the single
     /// bring-up CSpace. `None` for kernel tasks (the idle/boot task, the hog, the executor).
     proc_id: Option<usize>,
+    /// The task's isolation domain (P7b-ii): the process's PKU protection key (x86) / MTE tag
+    /// (aarch64). The scheduler programs it via [`arch::set_domain`] on switch-in, so a process
+    /// resumes with ONLY its own domain accessible — a raw read of a peer's page faults. `None` for
+    /// kernel tasks (all domains accessible; the kernel touches no foreign-keyed user page).
+    domain: Option<u64>,
 }
 
 struct Scheduler {
@@ -115,6 +120,7 @@ pub fn bootstrap() {
         state: State::Runnable,
         body: None,
         proc_id: None,
+        domain: None,
     });
     let mut g = SCHED.lock();
     *g = Some(Scheduler {
@@ -125,17 +131,24 @@ pub fn bootstrap() {
 
 /// Spawn a runnable kernel task with `body` and CPU-time `budget` (no bound userspace process).
 pub fn spawn(body: impl FnOnce() + Send + 'static, budget: Budget) {
-    spawn_inner(body, budget, None);
+    spawn_inner(body, budget, None, None);
 }
 
-/// Spawn a runnable task bound to userspace process `proc_id` (P7b): the EL0/ring-3 syscall handler
-/// resolves this task's invoked cptrs against that process's CSpace (see [`current_proc_id`]).
-pub fn spawn_proc(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: usize) {
-    spawn_inner(body, budget, Some(proc_id));
+/// Spawn a runnable task bound to userspace process `proc_id` in isolation `domain` (P7b): the
+/// EL0/ring-3 syscall handler resolves this task's invoked cptrs against that process's CSpace (see
+/// [`current_proc_id`]), and the scheduler programs `domain` (its PKU key / MTE tag) on switch-in
+/// so the process resumes with only its own memory reachable ([`arch::set_domain`]).
+pub fn spawn_proc(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: usize, domain: u64) {
+    spawn_inner(body, budget, Some(proc_id), Some(domain));
 }
 
 /// Allocate a guarded kernel stack, prime the initial context, and enqueue a new runnable task.
-fn spawn_inner(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: Option<usize>) {
+fn spawn_inner(
+    body: impl FnOnce() + Send + 'static,
+    budget: Budget,
+    proc_id: Option<usize>,
+    domain: Option<u64>,
+) {
     // Allocate the whole guarded block; the usable stack occupies its top `STACK_BYTES`, with a
     // guard frame directly below the stack's lowest byte.
     let block = memory::alloc_frames(GUARDED_STACK_ORDER)
@@ -160,6 +173,7 @@ fn spawn_inner(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: Op
         state: State::Runnable,
         body: Some(Box::new(body)),
         proc_id,
+        domain,
     });
     with_sched(|s| s.tasks.push(task));
 }
@@ -188,17 +202,22 @@ fn schedule() {
         match s.pick_next() {
             Some(next) if next != from => {
                 s.current = next;
-                Some((s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, kernel_stack_top(s, next)))
+                let ksp = kernel_stack_top(s, next);
+                let domain = s.tasks[next].domain;
+                Some((s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, ksp, domain))
             }
             _ => None,
         }
     });
-    if let Some((from_ptr, to_ptr, ksp)) = switch {
+    if let Some((from_ptr, to_ptr, ksp, domain)) = switch {
         // x86 `syscall` shares one kernel-RSP global, so point it (+ TSS.RSP0) at the incoming
         // task's kernel stack BEFORE it runs — no-op on aarch64 (per-task-banked SP_EL1).
         if let Some(top) = ksp {
             arch::set_kernel_stack(top);
         }
+        // Program the incoming task's isolation domain (PKU key / MTE tag) so a userspace process
+        // resumes with ONLY its own pages reachable; a kernel task (`None`) gets all keys (P7b-ii).
+        arch::set_domain(domain);
         // SAFETY: both pointers address stable boxed `Task` contexts that outlive the switch;
         // preemption is masked (single-CPU exclusion) so no concurrent code mutates them, and
         // `to` was primed by context_init or a prior switch. Control resumes here when this task
@@ -249,16 +268,19 @@ fn task_exit() -> ! {
             s.pick_next().map(|next| {
                 let from = s.current;
                 s.current = next;
-                (s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, kernel_stack_top(s, next))
+                let ksp = kernel_stack_top(s, next);
+                let domain = s.tasks[next].domain;
+                (s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, ksp, domain)
             })
         });
         match switch {
             // SAFETY: as in `schedule`; this finished task is never resumed, so the outgoing
             // context save is discarded — that is fine, its stack is abandoned.
-            Some((from_ptr, to_ptr, ksp)) => {
+            Some((from_ptr, to_ptr, ksp, domain)) => {
                 if let Some(top) = ksp {
                     arch::set_kernel_stack(top);
                 }
+                arch::set_domain(domain);
                 unsafe { arch::context_switch(from_ptr, to_ptr) }
             }
             None => {

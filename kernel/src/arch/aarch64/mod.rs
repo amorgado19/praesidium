@@ -23,8 +23,15 @@ pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user, set_ker
 pub const PEX_ARCH: u16 = abi::pex::ARCH_AARCH64;
 pub use paging::{
     activate_address_space, build_address_space, enable_wx, install_guard_page, map_page,
-    map_user_page, page_prot, sync_instruction_cache, translate,
+    map_user_page, page_prot, set_domain, sync_instruction_cache, translate,
 };
+
+/// The active process-vs-process isolation mechanism (P7b-ii, ISO-AC4 honesty). aarch64's primary
+/// is real FEAT_MTE (the per-domain-page-table fallback is the documented exception if it fails).
+#[must_use]
+pub fn isolation_mechanism() -> &'static str {
+    "aarch64 FEAT_MTE tag-check (ADR-0008 DEC-0008-3)"
+}
 pub use timer::timer_init;
 
 /// Mask IRQs (disable preemption), returning whether they were enabled before — pass that back

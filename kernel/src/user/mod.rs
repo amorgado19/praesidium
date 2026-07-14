@@ -90,8 +90,12 @@ const PONG_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PONG_PEX"));
 /// @ 0x4030_0000) and each other — all inside the reserved window [1 GiB, 2 GiB).
 const PING_STACK_VA: u64 = 0x4020_0000;
 const PONG_STACK_VA: u64 = 0x4040_0000;
-const DOMAIN_PING: u64 = 0x71;
-const DOMAIN_PONG: u64 = 0x72;
+/// Isolation domains (P7b-ii): the small non-zero value used as each process's PKU protection key
+/// (x86, PTE bits [62:59]) and MTE tag (aarch64). Key 0 is the kernel/default domain, so processes
+/// start at 1. A process's `PKRU` (set on switch-in) allows ONLY its own key, so a raw read of a
+/// peer's page faults — the CAP-MEM-3 payoff within one address space.
+const DOMAIN_PING: u64 = 1;
+const DOMAIN_PONG: u64 = 2;
 /// Process indices — a process's scheduler `proc_id` and its registry slot.
 const PING: usize = 0;
 const PONG: usize = 1;
@@ -297,7 +301,7 @@ fn setup_blob_cspace(id: usize) {
 /// Lay out a bring-up blob (copy its native code into an owned frame, make it coherent for
 /// instruction fetch, map code R-X + stack RW EL0-accessible), run it as process `id`'s scheduler
 /// task that drops to EL0, and drive it from the boot task until it leaves EL0.
-fn run_el0_process(blob: &[u8], id: usize, code_phys: u64, code_va: u64, stack_phys: u64, stack_va: u64) {
+fn run_el0_process(blob: &[u8], id: usize, domain: u64, code_phys: u64, code_va: u64, stack_phys: u64, stack_va: u64) {
     assert!(blob.len() <= PAGE, "bring-up blob exceeds a page");
     let code_hhdm = memory::phys_to_virt(code_phys);
     // SAFETY: `code_hhdm` is an HHDM-mapped, writable frame we own; `blob` is a disjoint static
@@ -307,10 +311,11 @@ fn run_el0_process(blob: &[u8], id: usize, code_phys: u64, code_va: u64, stack_p
         core::ptr::copy_nonoverlapping(blob.as_ptr(), code_hhdm as *mut u8, blob.len());
     }
     arch::sync_instruction_cache(code_hhdm, blob.len());
-    // SAFETY: map owned frames EL0-accessible at the process VAs — R-X code, RW stack (W^X).
+    // SAFETY: map owned frames EL0-accessible at the process VAs — R-X code, RW stack (W^X) — in the
+    // process's isolation `domain` (PKU key / MTE tag).
     unsafe {
-        arch::map_user_page(code_va, code_phys, arch::Prot::Rx);
-        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw);
+        arch::map_user_page(code_va, code_phys, arch::Prot::Rx, domain);
+        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw, domain);
     }
     let stack_top = stack_va + PAGE as u64;
 
@@ -322,6 +327,7 @@ fn run_el0_process(blob: &[u8], id: usize, code_phys: u64, code_va: u64, stack_p
         move || unsafe { arch::enter_user(code_va, stack_top) },
         Budget::new(u32::MAX, u32::MAX),
         id,
+        domain,
     );
     while !PROC_DONE[id].load(Ordering::Acquire) {
         scheduler::yield_now();
@@ -345,7 +351,7 @@ pub fn run() {
     let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for user stack"));
 
     // (1) Capability-mediated transport: DEBUG_EMIT then PROC_EXIT, each resolved + rights-checked.
-    run_el0_process(arch::el0_test_blob(), PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
+    run_el0_process(arch::el0_test_blob(), PING, DOMAIN_PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
     if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 {
         fatal("bring-up process did not exit cleanly");
     }
@@ -358,7 +364,7 @@ pub fn run() {
     unsafe {
         arch::map_page(FAULT_PROBE_VA, probe_phys, arch::Prot::Ro);
     }
-    run_el0_process(arch::el0_fault_blob(), PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
+    run_el0_process(arch::el0_fault_blob(), PING, DOMAIN_PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
     if PROC_EXIT[PING].load(Ordering::Relaxed) != u64::MAX {
         fatal("fault process was not killed by the EL0 fault path");
     }
@@ -394,9 +400,10 @@ fn load_process(
     );
     let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for refproc stack"));
     // SAFETY: map an owned frame RW + EL0-accessible at the process's stack VA (in the reserved
-    // window, disjoint from the segments + the other process's pages).
+    // window, disjoint from the segments + the other process's pages), tagged with the process's
+    // isolation `domain` (PKU key / MTE tag) — so a peer's raw read of this stack faults.
     unsafe {
-        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw);
+        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw, domain);
     }
     PROC_CSPACES.lock()[id] = Some(cs);
     (loaded.entry, stack_va + PAGE as u64)
@@ -424,6 +431,11 @@ pub fn run_processes() {
     let (pong_entry, pong_sp) =
         load_process(&mut loader, &mut scratch, PONG_PEX, DOMAIN_PONG, PONG, PONG_STACK_VA, "pong");
 
+    kprintln!(
+        "[praesidium] user: process-vs-process isolation armed — {} (ping=domain {DOMAIN_PING}, pong=domain {DOMAIN_PONG}); the red-team proves a cross-domain raw read is contained (P7b-ii)",
+        arch::isolation_mechanism()
+    );
+
     for id in [PING, PONG] {
         PROC_DONE[id].store(false, Ordering::Release);
         PROC_EXIT[id].store(0, Ordering::Relaxed);
@@ -434,12 +446,14 @@ pub fn run_processes() {
         move || unsafe { arch::enter_user(ping_entry, ping_sp) },
         Budget::new(u32::MAX, u32::MAX),
         PING,
+        DOMAIN_PING,
     );
     scheduler::spawn_proc(
         // SAFETY: as above, for pong.
         move || unsafe { arch::enter_user(pong_entry, pong_sp) },
         Budget::new(u32::MAX, u32::MAX),
         PONG,
+        DOMAIN_PONG,
     );
 
     // Drive both from the boot task until each leaves EL0.

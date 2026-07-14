@@ -346,15 +346,27 @@ fn user_page_desc(pa: u64, prot: Prot) -> u64 {
 /// userspace process's `.pex` segments so the process can reach them at EL0, while everything else
 /// (HHDM, kernel) stays supervisor-only — so an EL0 raw pointer into kernel memory faults.
 ///
+/// `domain` is the process's isolation domain (P7b-ii). On x86 it becomes the page's PKU key; on
+/// aarch64 it will drive MTE allocation-tagging (Normal-Tagged + granule tag), so a cross-domain
+/// raw read tag-faults — wired in the aarch64-MTE increment. Accepted now to keep the seam
+/// identical across arches.
+///
 /// # Safety
 /// `vaddr` must be a page in the process's reserved VA window the caller controls; `phys` a frame
 /// the caller owns. Overwrites any existing mapping of `vaddr`.
-pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot) {
+pub unsafe fn map_user_page(vaddr: u64, phys: u64, prot: Prot, domain: u64) {
+    let _ = domain; // aarch64 MTE domain-tagging is wired in the aarch64-MTE increment (task #16)
     let v = vaddr & !0xfff;
     let l3 = ensure_l3_table(v);
     write_entry(l3, lidx(v, 3), user_page_desc(phys & ADDR_MASK, prot));
     flush_page(v);
 }
+
+/// Program the isolation domain for the task the scheduler is switching in (P7b-ii). On aarch64 the
+/// MTE mechanism carries the domain in the process's *pointer tag* (set on EL0 entry), so there is
+/// no per-switch domain register to load — this is a no-op, kept to mirror the x86 `PKRU` switch
+/// (and a future per-domain-page-table fallback would swing `TTBR0` here).
+pub fn set_domain(_domain: Option<u64>) {}
 
 /// Make `len` bytes at `vaddr` coherent for instruction fetch after code has been written there
 /// through the data path (ADR-0006 / GC-09 — the cache-maintenance seam owed since P0, now that

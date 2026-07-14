@@ -115,6 +115,12 @@ pub fn gdt_init() {
     // Clear IF on `syscall` entry — the handler runs non-preemptibly (matches the aarch64 DAIF mask;
     // preemptible userspace is P7b).
     SFMask::write(RFlags::INTERRUPT_FLAG);
+
+    // Probe + enable PKU (protection keys for user pages) — the P7b-ii process-vs-process isolation
+    // mechanism (ADR-0008 DEC-0008-2). Done before any userspace so a process's first switch-in can
+    // program PKRU; if absent, the per-domain-page-table fallback isolates instead (logged at use).
+    let pku = super::pku::init();
+    kprintln!("[praesidium] user: x86 PKU {} (CR4.PKE)", if pku { "enabled — process-vs-process isolation via protection keys" } else { "UNAVAILABLE — per-domain-page-table fallback will isolate" });
 }
 
 /// Drop to ring 3 at `entry` with user stack `user_sp`. Never returns: the process runs until it

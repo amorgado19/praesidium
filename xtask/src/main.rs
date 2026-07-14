@@ -129,6 +129,11 @@ struct Scenario {
     forbidden: &'static [&'static str],
     /// Headline success marker (the last required) — also the early-exit trigger.
     success: &'static str,
+    /// Optional x86-64 QEMU machine/cpu override (replaces [`ArchSpec::machine`] on x86 only). The
+    /// isolation-carrying scenario pins `accel=tcg -cpu max` so PKU is *emulated* deterministically,
+    /// byte-identically everywhere — the x86 parallel to aarch64's `-cpu max -machine mte=on`, so the
+    /// PKU isolation primary is actually exercised in CI rather than varying by host/KVM (anti-theater).
+    x86_machine: Option<&'static [&'static str]>,
 }
 
 /// Forbidden markers shared by every scenario.
@@ -264,54 +269,66 @@ const SCENARIOS: &[Scenario] = &[
         required: P0_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P0-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "mem",
         required: P1_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P1-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "cap",
         required: P2_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P2-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "sched",
         required: P3A_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P3A-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "preempt",
         required: PREEMPT_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P3-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "ipc",
         required: IPC_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P4-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "isolation",
         required: ISOLATION_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P5B-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "loader",
         required: LOADER_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P6-OK",
+        x86_machine: None,
     },
     Scenario {
         name: "user",
         required: USER_REQUIRED,
         forbidden: FORBIDDEN,
         success: "PRAESIDIUM-P7B-I3-OK",
+        // The isolation-carrying scenario: force TCG + `-cpu max` on x86 so PKU is emulated
+        // deterministically (host-/KVM-independent), guaranteeing the PKU isolation primary is
+        // exercised every run — not silently replaced by the fallback under a no-KVM CI.
+        x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
     },
 ];
 
@@ -365,10 +382,18 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
         format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user)")
     })?;
     let (required, success): (&[&str], &str) = (sc.required, sc.success);
+    // An x86 scenario pinned to TCG (the isolation `user` scenario) boots far slower than KVM, so
+    // its default watchdog matches the TCG-sized aarch64 budget unless overridden explicitly.
+    let tcg_x86 = arch.name == "x86_64" && sc.x86_machine.is_some();
+    let default_timeout = if tcg_x86 {
+        arch.default_timeout.max(180)
+    } else {
+        arch.default_timeout
+    };
     let timeout = arg_value(args, "--timeout")
         .map(|s| s.parse::<u64>().map_err(|_| format!("bad --timeout: {s}")))
         .transpose()?
-        .unwrap_or(arch.default_timeout);
+        .unwrap_or(default_timeout);
 
     let root = workspace_root();
     let kernel = build_kernel(arch)?;
@@ -387,9 +412,16 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     );
     // Capture the run outcome WITHOUT `?` so swtpm is always cleaned up, even if
     // run_qemu errors (otherwise a leaked swtpm child lingers).
+    // Per-scenario x86 machine override (e.g. the `user` isolation scenario pins `accel=tcg -cpu max`
+    // for deterministic PKU); other scenarios and aarch64 use the arch default.
+    let machine: &[&str] = match (arch.name, sc.x86_machine) {
+        ("x86_64", Some(m)) => m,
+        _ => arch.machine,
+    };
     let run = run_qemu(
         &root,
         arch,
+        machine,
         &esp,
         &code,
         &vars,
@@ -739,6 +771,7 @@ fn start_swtpm(root: &Path) -> Option<(Child, PathBuf)> {
 fn run_qemu(
     root: &Path,
     arch: &ArchSpec,
+    machine: &[&str],
     esp: &Path,
     code: &Path,
     vars: &Path,
@@ -748,7 +781,7 @@ fn run_qemu(
     success_marker: &str,
 ) -> Result<(String, bool), String> {
     let mut args: Vec<String> = Vec::new();
-    for m in arch.machine {
+    for m in machine {
         args.push((*m).into());
     }
     args.push("-m".into());

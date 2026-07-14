@@ -177,7 +177,7 @@ pub fn load(
             // shadows only an unused identity-alias VA.
             unsafe {
                 if user_accessible {
-                    arch::map_user_page(va, pa, prot);
+                    arch::map_user_page(va, pa, prot, domain_id);
                 } else {
                     arch::map_page(va, pa, prot);
                 }

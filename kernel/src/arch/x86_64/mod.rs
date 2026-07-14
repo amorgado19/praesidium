@@ -9,6 +9,7 @@ use core::arch::asm;
 mod context;
 mod interrupts;
 mod paging;
+mod pku;
 mod timer;
 mod user;
 pub use context::{context_init, context_switch, Context};
@@ -17,7 +18,19 @@ pub use paging::{
     activate_address_space, build_address_space, build_domain_excluding, enable_wx,
     install_guard_page, map_page, map_user_page, page_prot, sync_instruction_cache, translate,
 };
+pub use pku::set_domain;
 pub use timer::timer_init;
+
+/// The active process-vs-process isolation mechanism (P7b-ii, ISO-AC4 honesty): the PKU primary
+/// when hardware protection keys are present + enabled, otherwise the per-domain-page-table fallback.
+#[must_use]
+pub fn isolation_mechanism() -> &'static str {
+    if pku::available() {
+        "x86 PKU protection keys (ADR-0008 DEC-0008-2)"
+    } else {
+        "x86 per-domain page tables (fallback, ADR-0008 DEC-0008-6)"
+    }
+}
 pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user, set_kernel_stack};
 
 /// The `.pex` architecture tag for this backend (ADR-0006): a `.pex`'s segments are native code,
