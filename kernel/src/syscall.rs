@@ -94,6 +94,20 @@ pub fn invoke<const N: usize>(cs: &CSpace<N>, inv: &Invocation) -> Result<u64, I
             Ok(cap.badge)
         }
 
+        // Shared read-only transfer region (v1.1): a `SharedRo` cap (**requires `READ`**) returns
+        // the read-only VA the kernel co-mapped its region at (RI: the holder learns its window from
+        // the cap, never ambiently). No map operation — the co-mapping was done privileged at
+        // share-time. The `aux` field packs the VA as `va >> 12`.
+        op::SHARED_QUERY => {
+            if cap.cap_type != CapType::SharedRo {
+                return Err(InvokeError::WrongType);
+            }
+            if !cap.rights.contains(Rights::READ) {
+                return Err(InvokeError::InsufficientRights);
+            }
+            Ok(u64::from(cap.aux) << 12)
+        }
+
         _ => Err(InvokeError::UnknownOp),
     }
 }

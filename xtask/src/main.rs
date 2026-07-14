@@ -266,6 +266,14 @@ const USER_REQUIRED: &[&str] = &[
     "isolation armed",                    // per-process domains assigned (PKU keys / MTE tags)
     "AC7.3 isolation red-team CONTAINED", // the hostile cross-domain raw read faulted; evil killed
     "PRAESIDIUM-P7B-II-OK",
+    // v1.1 (Target A): the shared read-only transfer region — ping publishes bulk into a region
+    // co-mapped RW in its table / RO in pong's; pong reads it zero-copy through its SharedRo window
+    // and echoes it. Then a hostile RO-window holder proves it cannot reach beyond the region.
+    "shared RO transfer region co-mapped", // the kernel co-mapped it (RI via caps, no EL0 map op)
+    "EL0 syscall DEBUG value=0x5eedda7ad00df00d", // pong (+ ping's echo) read the bulk sentinel zero-copy
+    "zero-copy transfer OK",              // the region round-trip closed
+    "shared-region red-team CONTAINED",   // a hostile RO-window holder couldn't reach beyond the region
+    "PRAESIDIUM-V1.1-A-OK",
 ];
 
 const SCENARIOS: &[Scenario] = &[
@@ -329,7 +337,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "user",
         required: USER_REQUIRED,
         forbidden: FORBIDDEN,
-        success: "PRAESIDIUM-P7B-II-OK",
+        success: "PRAESIDIUM-V1.1-A-OK",
         // The isolation-carrying scenario: force TCG + `-cpu max` on x86 so PKU is emulated
         // deterministically (host-/KVM-independent), guaranteeing the PKU isolation primary is
         // exercised every run — not silently replaced by the fallback under a no-KVM CI.

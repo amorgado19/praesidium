@@ -6,6 +6,13 @@
 //! forge the victim's MTE tag into the pointer (the tag is 4 bits the process itself controls). A
 //! sound isolation backstop must contain the read anyway (a mechanism the process cannot defeat); if
 //! the read RETURNS, isolation FAILED and `evil` reports the breach loudly.
+//!
+//! v1.1: `evil` is also a legitimate holder of a `SharedRo` capability (a read-only window into the
+//! shared transfer region). It READS the region (allowed — that is the point of a RO window) and
+//! then tries to use that foothold to reach the owner's OTHER memory (ping's segment, NOT part of
+//! the region). Per-domain page tables map ONLY the region into evil's table, so the out-of-region
+//! read faults regardless of WRPKRU/tag-forge — proving a shared window cannot be turned into a
+//! general read of the owner.
 #![no_std]
 #![no_main]
 
@@ -24,6 +31,12 @@ const VICTIM_DOMAIN: u64 = 1;
 /// kernel then kills `evil`. If the read RETURNS, isolation has FAILED — report the stolen word.
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // v1.1: evil legitimately holds a SharedRo cap — it may READ the shared window (intended). Learn
+    // the window VA from the cap (RI) and read it; this must SUCCEED (a RO holder reads the region).
+    let region_va = refproc::shared_region();
+    let shared = refproc::shared_read(region_va);
+    refproc::debug(shared); // proves evil read the shared region (== SHARED_SENTINEL) — that's allowed
+
     // Active bypass: unlock all PKU protection keys. WRPKRU is UNPRIVILEGED — usable from ring 3 —
     // so a hostile process can clear its own PKRU and defeat protection-key isolation entirely.
     #[cfg(target_arch = "x86_64")]

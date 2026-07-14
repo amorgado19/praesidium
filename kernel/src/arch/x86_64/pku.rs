@@ -85,16 +85,22 @@ pub fn init() -> bool {
     true
 }
 
-/// Write `PKRU` so **only** key `allow` is accessible and every other key is Access-Disabled
-/// (AD) — the domain mask for a process holding protection key `allow`. `PKRU` is 2 bits per key
-/// (`bit 2k` = AD, `bit 2k+1` = WD); we set AD for all keys, then clear AD (and WD) for `allow`.
-/// Key 0 (the kernel/default domain) is included in the disable when `allow != 0`, since a
-/// process's pages are all tagged with its own key — it needs no key-0 user page.
+/// Write `PKRU` so a process may access **its own key `allow`** and **key 0 (the SHARED domain)**,
+/// and every other key is Access-Disabled (AD). `PKRU` is 2 bits per key (`bit 2k` = AD, `bit 2k+1`
+/// = WD); we set AD for all keys, then clear AD for `allow` and for key 0. Key 0 is the shared
+/// domain: the v1.1 read-only transfer region ([`super::super::map_user_page`] with domain 0) is
+/// keyed 0 so it is reachable in *every* process's PKU context — while a process's OWN pages (its
+/// non-zero key) stay private. This does NOT weaken isolation: PKU is only defence-in-depth; the
+/// real boundary is the per-domain page table, which maps only this process's pages + the shared
+/// region, so allowing key 0 exposes exactly the (intended, co-mapped) transfer region and nothing
+/// else. Access to it is still gated by holding a `SharedRo`/`Frame` cap (the kernel co-maps it
+/// only for cap holders) — PKU is not the authority, the capability + the page table are.
 fn write_pkru_allow_only(allow: u64) {
-    // Access-Disable every key, then re-enable `allow` (clear its AD+WD pair).
+    // Access-Disable every key, then re-enable `allow` and key 0 (the shared domain).
     let mut pkru: u32 = 0x5555_5555; // AD=1 for all 16 keys, WD=0
     let k = (allow & 0xf) as u32;
-    pkru &= !(0b01 << (2 * k)); // clear AD for the allowed key (WD already 0)
+    pkru &= !(0b01 << (2 * k)); // clear AD for the process's own key
+    pkru &= !0b01; // clear AD for key 0 — the shared RO transfer region (v1.1)
     write_pkru(pkru);
 }
 

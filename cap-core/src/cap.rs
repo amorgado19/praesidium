@@ -39,6 +39,15 @@ pub enum CapType {
     /// the `VSpace` MAP_TABLE right, so it can run in its domain but never remap it (which would
     /// be an isolation escape). Kernel-managed identity — non-duplicable, like `Sched`.
     Domain,
+    /// A **read-only shared window** into another principal's frame(s) (v1.1, ADR-0004). Names a
+    /// region (`objref` = base frame number, `size` = frames, `aux` = the read-only VA the kernel
+    /// co-mapped it at) the holder may only READ — the type is *structurally* read-only-shared
+    /// (there is no `SharedRo` with WRITE; upgrading is unrepresentable), so a peer across a trust
+    /// boundary can be handed zero-copy read access to bulk data WITHOUT any ability to write it or
+    /// to reach anything else. The kernel co-maps it (privileged, at share-time) — the holder gets
+    /// no map operation. Non-duplicable + non-grantable by userspace (kernel-installed only), like
+    /// `Reply`: shared-memory authority across a trust boundary is never laundered or re-shared.
+    SharedRo,
 }
 
 /// The type-erased capability record (SPEC-CAP §4 layer 1). Not a pointer: `objref` is an
@@ -123,6 +132,7 @@ object_types! {
     Device => Device,
     IrqControl => IrqControl,
     Domain => Domain,
+    SharedRo => SharedRo,
 }
 
 /// A typed, non-`Copy` capability handle. Holding a `Cap<Frame>` is the only way to name a

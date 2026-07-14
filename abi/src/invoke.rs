@@ -68,6 +68,13 @@ pub mod op {
     /// REPLY on the single-use `Reply` capability RECV minted (**consumes it**, CAP-REPLY-1): deliver
     /// the first argument register to the one blocked caller it names, unblocking it.
     pub const ENDPOINT_REPLY: u16 = 0x22;
+
+    /// **Shared read-only transfer region (v1.1, ADR-0004).** Query a `SharedRo` capability
+    /// (**requires `READ`**): return the read-only virtual address the kernel co-mapped the shared
+    /// region at, so the holder reads the shared bulk data zero-copy *through the capability* (RI —
+    /// it learns the window VA from the cap, not ambiently). No map operation is exposed; the
+    /// co-mapping was done, privileged, at share-time — userspace never edits a page table.
+    pub const SHARED_QUERY: u16 = 0x30;
 }
 
 /// A capability invocation: perform `op` on the capability at `cptr`, with `args`. The concrete

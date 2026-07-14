@@ -104,6 +104,19 @@ const EVIL_STACK_VA: u64 = 0x4060_0000;
 const DOMAIN_PING: u64 = 1;
 const DOMAIN_PONG: u64 = 2;
 const DOMAIN_EVIL: u64 = 3;
+
+// ---- v1.1: shared read-only transfer region (ADR-0004 no-swap bulk data-passing) ----
+/// The VA the kernel co-maps the shared region at, in every holder's table (matches
+/// `refproc::SHARED_VA`). Disjoint from the processes' segments/stacks, inside the reserved window.
+const SHARED_VA: u64 = 0x4070_0000;
+/// The CSpace slot the shared-region cap is installed at (matches `refproc::SHARED`); free of the
+/// manifest slots (1=Sched, 2=Endpoint, 3=Reply).
+const SHARED_SLOT: Cptr = 4;
+/// The shared region's isolation domain: 0 (the shared key / untagged). Reachable in every process's
+/// isolation context (x86 PKRU allows key 0; aarch64 leaves it untagged) — but the per-domain page
+/// table maps it ONLY into a cap-holder's table, so it is the *only* co-mapped thing and nothing
+/// else of the owner's is reachable. PKU/MTE are defence-in-depth; the page table + cap are the gate.
+const SHARED_DOMAIN: u64 = 0;
 /// Process indices — a process's scheduler `proc_id` and its registry slot.
 const PING: usize = 0;
 const PONG: usize = 1;
@@ -443,6 +456,72 @@ fn load_process(
     (loaded.entry, stack_va + PAGE as u64, space)
 }
 
+/// v1.1: map the shared region frame `phys` at [`SHARED_VA`] into `space` with `prot` (RW for the
+/// owner, RO for a peer), in the shared domain. Preemption-masked activate/map/restore (like
+/// [`load_process`]) so the scheduler's active-space tracking stays consistent. The co-map is done by
+/// the KERNEL at share-time — userspace never edits a page table (the ruling: no EL0 map primitive).
+fn map_shared_into(space: arch::AddressSpace, phys: u64, prot: arch::Prot) {
+    let prev = arch::preempt_disable();
+    // SAFETY: `space` shares the kernel mappings, so the boot task keeps running across the switch;
+    // map the shared frame at SHARED_VA with `prot` in the shared domain, then restore kernel space.
+    unsafe {
+        arch::activate_address_space(space);
+        arch::map_user_page(SHARED_VA, phys, prot, SHARED_DOMAIN);
+        arch::activate_address_space(arch::kernel_space());
+    }
+    arch::preempt_restore(prev);
+}
+
+/// v1.1 red-team evidence (kernel-side): confirm the shared region is mapped READ-ONLY in a peer's
+/// `space` — a hostile holder of the RO window can never write it to corrupt the owner. FATAL if it
+/// is writable or unmapped (fail closed).
+fn assert_shared_ro(space: arch::AddressSpace) {
+    let prev = arch::preempt_disable();
+    // SAFETY: activate the peer space to walk its tables for SHARED_VA's protection, then restore.
+    let prot = unsafe {
+        arch::activate_address_space(space);
+        let p = arch::page_prot(SHARED_VA);
+        arch::activate_address_space(arch::kernel_space());
+        p
+    };
+    arch::preempt_restore(prev);
+    match prot {
+        Some((false, _)) => {} // read-only (not writable) — good
+        other => {
+            kprintln!("[praesidium] FATAL: user: shared region not READ-ONLY in the peer: {other:?}");
+            arch::halt();
+        }
+    }
+}
+
+/// v1.1: set up the shared read-only transfer region between the OWNER (`ping`, RW) and the PEER
+/// (`pong`, RO), installing the authorizing caps (RI: the kernel co-maps the region ONLY for cap
+/// holders — a `Frame`(RW) for the owner, a `SharedRo` for the peer; no EL0 map op). Returns the
+/// region frame number so the red-team peer (`evil`) can be co-mapped the SAME frame.
+fn setup_shared_region(owner_space: arch::AddressSpace, peer_space: arch::AddressSpace) -> u64 {
+    let phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for the shared region"));
+    memory::zero_frame(phys); // no prior contents leak into the shared window
+    let pfn = u64::from(phys_to_pfn(phys));
+    map_shared_into(owner_space, phys, arch::Prot::Rw); // owner: read-write
+    map_shared_into(peer_space, phys, arch::Prot::Ro); // peer: read-only
+    assert_shared_ro(peer_space); // red-team: the peer's window is RO — it cannot corrupt the owner
+    {
+        let mut g = PROC_CSPACES.lock();
+        g[PING]
+            .as_mut()
+            .unwrap_or_else(|| fatal("shared: ping CSpace missing"))
+            .install_frame(SHARED_SLOT, pfn, 1, Rights::READ | Rights::WRITE);
+        g[PONG]
+            .as_mut()
+            .unwrap_or_else(|| fatal("shared: pong CSpace missing"))
+            .install_shared_ro(SHARED_SLOT, pfn, 1, SHARED_VA);
+    }
+    kprintln!(
+        "[praesidium] user: v1.1 shared RO transfer region co-mapped @ {SHARED_VA:#x} (owner=ping RW, peer=pong RO); RI via Frame/SharedRo caps, kernel co-map (no EL0 map op)"
+    );
+    pfn
+}
+
 /// P7b (i.2/i.3): load the real `refproc` ping + pong `.pex` binaries and run them CONCURRENTLY at
 /// EL0/ring-3, each resolving its OWN capabilities via the per-Task CSpace binding. Both load from
 /// ONE loader authority, so they share the one Endpoint (ping SEND, pong SEND+RECV): ping CALLs a
@@ -474,6 +553,11 @@ pub fn run_processes() {
         arch::isolation_mechanism()
     );
 
+    // v1.1: co-map a shared read-only transfer region between ping (owner, RW) and pong (peer, RO)
+    // BEFORE they run, so ping's round 2 can publish bulk data zero-copy and pong reads it through
+    // its RO window. The SAME frame is co-mapped into evil (the red-team peer) below.
+    let shared_pfn = setup_shared_region(ping_space, pong_space);
+
     for id in [PING, PONG] {
         PROC_DONE[id].store(false, Ordering::Release);
         PROC_EXIT[id].store(0, Ordering::Relaxed);
@@ -504,10 +588,13 @@ pub fn run_processes() {
         fatal("a refproc process did not exit cleanly");
     }
     kprintln!("[praesidium] PRAESIDIUM-P7B-I3-OK");
+    kprintln!(
+        "[praesidium] user: v1.1 zero-copy transfer OK — ping published bulk to the shared region, pong read it through its RO window and echoed it (no per-message Frame map / kernel copy)"
+    );
 
     // ---- AC7.3 red-team: a HOSTILE .pex raw-reads pong's memory. The isolation backstop must fault
     // it, the kernel kills it, and ping/pong + the kernel survive. The existential proof (CAP-MEM-3).
-    run_redteam(&mut loader, &mut scratch);
+    run_redteam(&mut loader, &mut scratch, shared_pfn);
 }
 
 /// P7b-ii red-team (AC7.3): load the hostile `evil` `.pex` in its OWN isolation domain and run it. It
@@ -518,13 +605,23 @@ pub fn run_processes() {
 /// closed + loud) and that the kernel ran on to here. `pong`'s pages remain mapped after it exited
 /// (no reaper yet), so the target is live. This is the CAP-MEM-3 payoff against a REAL hostile
 /// native binary — distinct from P5b's *armed* in-kernel proof. Emits `PRAESIDIUM-P7B-II-OK`.
-fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr) {
+fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr, shared_pfn: u64) {
     kprintln!(
         "[praesidium] user: P7b-ii AC7.3 red-team — loading HOSTILE evil.pex (it raw-reads ping's memory at {:#x}, in the demo-split window)",
         PING_STACK_VA - 0x10_0000 // ping's segment base 0x4010_0000 (see evil::VICTIM_VA)
     );
     let (evil_entry, evil_sp, evil_space) =
         load_process(loader, scratch, EVIL_PEX, DOMAIN_EVIL, EVIL, EVIL_STACK_VA, "evil");
+
+    // v1.1: evil is a LEGITIMATE SharedRo holder — co-map the SAME shared region RO into evil's table
+    // and install its SharedRo cap. evil may READ the region (allowed) but the per-domain table maps
+    // ONLY the region into evil's table, so its attempt to use that foothold to reach ping's OTHER
+    // memory (below) still faults — a shared window cannot be turned into a general read of the owner.
+    map_shared_into(evil_space, pfn_to_phys(shared_pfn as u32), arch::Prot::Ro);
+    PROC_CSPACES.lock()[EVIL]
+        .as_mut()
+        .unwrap_or_else(|| fatal("shared: evil CSpace missing"))
+        .install_shared_ro(SHARED_SLOT, shared_pfn, 1, SHARED_VA);
 
     PROC_DONE[EVIL].store(false, Ordering::Release);
     PROC_EXIT[EVIL].store(0, Ordering::Relaxed);
@@ -551,4 +648,11 @@ fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr) {
         arch::isolation_mechanism()
     );
     kprintln!("[praesidium] PRAESIDIUM-P7B-II-OK");
+    // v1.1: evil held a legit SharedRo window and READ the region (allowed), yet could NOT use it as
+    // a foothold to reach ping's OTHER memory — the out-of-region read faulted. The shared region is
+    // the ONLY co-mapped thing, read-only, and reached only through a capability (RI). Target A done.
+    kprintln!(
+        "[praesidium] user: v1.1 shared-region red-team CONTAINED — a hostile RO-window holder read the region but could NOT reach beyond it (per-domain tables map only the region); RO enforced"
+    );
+    kprintln!("[praesidium] PRAESIDIUM-V1.1-A-OK");
 }

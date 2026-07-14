@@ -143,6 +143,67 @@ impl<const N: usize> CSpace<N> {
         };
     }
 
+    /// Install a `SharedRo` capability at `slot` (v1.1, ADR-0004): a **read-only shared window**
+    /// naming `frames` frame(s) from base frame number `base_pfn`, which the kernel has co-mapped
+    /// read-only into this holder's address space at virtual address `va`. Carries **only** `READ`
+    /// — the type has no writable form — so the holder can read the shared bulk data zero-copy but
+    /// can neither write it nor reach anything else. Kernel-installed only (COPY/MINT/GRANT/RETYPE
+    /// all refuse it): shared-memory authority across a trust boundary is never laundered onward.
+    /// `va` must be page-aligned and below 4 GiB (it is packed as `va >> 12` into `aux`).
+    pub fn install_shared_ro(&mut self, slot: Cptr, base_pfn: u64, frames: u32, va: u64) {
+        debug_assert!(slot < N, "install_shared_ro: slot out of bounds");
+        debug_assert!(va & 0xfff == 0 && va < (1 << 44), "install_shared_ro: bad va");
+        self.slots[slot] = Cte {
+            cap: RawCap {
+                cap_type: CapType::SharedRo,
+                rights: Rights::READ,
+                objref: base_pfn,
+                size: frames,
+                watermark: 0,
+                aux: (va >> 12) as u32,
+                badge: 0,
+            },
+            parent: NIL,
+        };
+    }
+
+    /// Install a `Frame` capability at `slot` naming `frames` frame(s) from base frame number
+    /// `base_pfn`, with `rights` — the kernel-managed grant path (like [`set_root_untyped`], used
+    /// for a kernel-created object rather than one RETYPEd from a process's `Untyped`). Used by the
+    /// v1.1 shared transfer region to give the OWNER a read-write `Frame` cap to the region the
+    /// kernel co-mapped RW into its address space (RI: the owner's write authority is a held cap,
+    /// not ambient). A `Frame` is duplicable/grantable per its rights (unlike `SharedRo`).
+    pub fn install_frame(&mut self, slot: Cptr, base_pfn: u64, frames: u32, rights: Rights) {
+        debug_assert!(slot < N, "install_frame: slot out of bounds");
+        self.slots[slot] = Cte {
+            cap: RawCap {
+                cap_type: CapType::Frame,
+                rights,
+                objref: base_pfn,
+                size: frames,
+                watermark: 0,
+                aux: 0,
+                badge: 0,
+            },
+            parent: NIL,
+        };
+    }
+
+    /// Resolve a `SharedRo` cap at `cptr`, require `READ`, and return the read-only VA the kernel
+    /// co-mapped its region at (`aux << 12`). The holder reads its shared window THROUGH the cap
+    /// (RI: it learns the VA from the capability, not ambiently) — no map operation is exposed; the
+    /// co-mapping was done, privileged, at share-time. Fails closed if the slot is not a `SharedRo`.
+    pub fn shared_ro_region(&self, cptr: Cptr) -> Result<u64, CapError> {
+        let s = self.live(cptr)?;
+        if s.cap_type != CapType::SharedRo {
+            return Err(CapError::WrongType);
+        }
+        if !s.rights.contains(Rights::READ) {
+            return Err(CapError::InsufficientRights);
+        }
+        Ok(u64::from(s.aux) << 12)
+    }
+
     /// Capability-gated domain entry (DEC-0008-5): resolve the `Domain` cap at `cptr`, require it
     /// carries `ENTER`, and return the domain id it authorizes entering. No `Domain` cap (or no
     /// `ENTER`) ⇒ entry refused — there is no ambient "switch to domain X". The kernel calls this
@@ -268,7 +329,7 @@ impl<const N: usize> CSpace<N> {
         let s = self.live(src)?;
         if matches!(
             s.cap_type,
-            CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain
+            CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain | CapType::SharedRo
         ) {
             // Non-duplicable types. Untyped/Sched carry per-cap allocation state (retype
             // watermark; CPU-time budget), so a COPY/MINT would fork it — forking the frame
@@ -276,6 +337,9 @@ impl<const N: usize> CSpace<N> {
             // SPLIT, never MINT. `Reply` is single-use and names exactly one blocked caller
             // (CAP-REPLY-1): duplicating it would let a server hoard reply authority and reply
             // to the wrong/old caller — the exact leak the split-out Reply cap exists to prevent.
+            // `SharedRo` is a read-only window into another principal's memory across a trust
+            // boundary (v1.1): duplicating/re-badging it would let a peer re-share that access
+            // onward — shared-memory authority across a boundary is never laundered.
             return Err(CapError::InsufficientRights);
         }
         if !s.rights.contains(Rights::DERIVE) {
@@ -301,9 +365,9 @@ impl<const N: usize> CSpace<N> {
         let s = self.live(src)?;
         if matches!(
             s.cap_type,
-            CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain
+            CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain | CapType::SharedRo
         ) {
-            return Err(CapError::InsufficientRights); // Untyped/Sched/Reply are never duplicable (see mint)
+            return Err(CapError::InsufficientRights); // Untyped/Sched/Reply/Domain/SharedRo never duplicable (see mint)
         }
         if !s.rights.contains(Rights::DERIVE) {
             return Err(CapError::InsufficientRights);
@@ -511,6 +575,11 @@ impl<const N: usize> CSpace<N> {
         // is pure CPU-time accounting with no backing frames (its `size` is a budget, not a
         // frame count); a `Reply` is a kernel record naming a caller (its `objref` is a caller
         // id, not a frame number) — zeroing any of these would scribble memory at a bogus address.
+        // A `SharedRo` names a frame it does NOT own (a read-only borrowed window into another
+        // principal's memory); the owner's `Frame` cap lives in a DIFFERENT CSpace, so the
+        // same-CSpace `another` check never sees it — zeroing on destroy would scribble the OWNER's
+        // live shared frame through a structurally-read-only, non-owning cap (a write-via-non-owner
+        // hazard, and an isolation escape if a delete/revoke op is ever exposed). Never zero it.
         let another = (0..N).any(|k| {
             let c = self.slots[k].cap;
             !c.is_null() && c.cap_type as u8 == cap.cap_type as u8 && c.objref == cap.objref
@@ -518,7 +587,11 @@ impl<const N: usize> CSpace<N> {
         if !another
             && !matches!(
                 cap.cap_type,
-                CapType::Untyped | CapType::Sched | CapType::Reply | CapType::Domain
+                CapType::Untyped
+                    | CapType::Sched
+                    | CapType::Reply
+                    | CapType::Domain
+                    | CapType::SharedRo
             )
         {
             (self.zero)(cap.objref, cap.size);
@@ -578,9 +651,12 @@ pub fn grant<const N: usize, const M: usize>(
     mode: GrantMode,
 ) -> Result<(), CapError> {
     let s = src.live(src_slot)?;
-    if s.cap_type == CapType::Reply {
+    if matches!(s.cap_type, CapType::Reply | CapType::SharedRo) {
         // A Reply names exactly one blocked caller and is single-use — it is never transferable
         // (CAP-REPLY-1); granting it would be the reply-authority-hoarding leak it prevents.
+        // A SharedRo is a read-only cross-boundary memory window the KERNEL co-maps at share-time
+        // (v1.1): it is never transferable by userspace either — a peer cannot re-share its RO
+        // access onward, so the "only co-mapped thing" guarantee cannot be laundered into a chain.
         return Err(CapError::InsufficientRights);
     }
     if mode == GrantMode::Mint
@@ -632,6 +708,7 @@ fn is_retypeable(t: CapType) -> bool {
             | CapType::IrqControl
             | CapType::Sched
             | CapType::Domain // kernel-managed isolation identity, created via set_root_domain
+            | CapType::SharedRo // kernel-installed cross-boundary RO window, via install_shared_ro
     )
 }
 
@@ -1333,5 +1410,56 @@ mod tests {
         cs.set_root_domain(1, 0xFFFF_FFFF); // huge id — catastrophic if treated as a frame
         cs.delete(1).unwrap();
         Z.with(|z| assert_eq!(z.get(), 0, "Domain destruction must never zero frames"));
+    }
+
+    #[test]
+    fn shared_ro_is_read_only_kernel_installed_and_non_launderable() {
+        // A SharedRo is a read-only window into another principal's memory across a trust boundary
+        // (v1.1). It is structurally read-only, learned through the cap (RI), and never launderable.
+        let mut cs = CSpace::<8>::new(nz);
+        cs.install_shared_ro(1, 0x1234, 1, 0x4070_0000); // base_pfn, frames, co-map VA
+        let c = cs.resolve(1).unwrap();
+        assert_eq!(c.cap_type, CapType::SharedRo);
+        assert_eq!(c.rights, Rights::READ, "structurally read-only — there is no WRITE form");
+        assert_eq!(c.objref, 0x1234);
+        // The holder learns its window VA THROUGH the cap (RI), not ambiently; fails closed otherwise.
+        assert_eq!(cs.shared_ro_region(1), Ok(0x4070_0000));
+        assert_eq!(cs.shared_ro_region(2), Err(CapError::EmptySlot));
+        cs.set_root_untyped(0, 16);
+        assert_eq!(cs.shared_ro_region(0), Err(CapError::WrongType));
+        // Non-launderable: COPY / MINT / RETYPE all refuse it (kernel-installed only), so a peer can
+        // never re-share its RO access onward — the "only co-mapped thing" guarantee cannot chain.
+        assert_eq!(cs.copy(1, 2), Err(CapError::InsufficientRights));
+        assert_eq!(cs.mint(1, 2, Rights::READ, 0), Err(CapError::InsufficientRights));
+        assert!(cs.resolve(1).is_ok(), "the cap survives refused duplication");
+        let mut cu = CSpace::<8>::new(nz);
+        cu.set_root_untyped(0, 64);
+        assert_eq!(cu.retype(0, CapType::SharedRo, 1, 1, 1), Err(CapError::WrongType));
+        // Non-grantable by userspace either (kernel-installed only, like Reply).
+        let mut dst = CSpace::<8>::new(nz);
+        assert_eq!(
+            grant(&mut cs, 1, &mut dst, 3, Rights::READ, 0, GrantMode::Move),
+            Err(CapError::InsufficientRights),
+            "a SharedRo is never transferable by userspace"
+        );
+    }
+
+    #[test]
+    fn shared_ro_destroy_zeroes_no_frames() {
+        // A SharedRo names a frame it does NOT own (a read-only borrowed window); the owner's Frame
+        // cap lives in a different CSpace, so the last-cap check can't see it. Destroying the SharedRo
+        // must NEVER zero the frame — else tearing down a peer's RO cap scribbles the OWNER's live
+        // shared data through a structurally-read-only, non-owning cap.
+        use core::cell::Cell;
+        thread_local!(static Z: Cell<u32> = const { Cell::new(0) });
+        fn rec(_: u64, _: u32) {
+            Z.with(|z| z.set(z.get() + 1));
+        }
+        let mut cs = CSpace::<8>::new(rec);
+        cs.install_shared_ro(1, 0x1234, 1, 0x4070_0000); // objref 0x1234 = the OWNER's frame, borrowed RO
+        cs.delete(1).unwrap();
+        Z.with(|z| {
+            assert_eq!(z.get(), 0, "SharedRo destruction must never zero the owner's frame")
+        });
     }
 }
