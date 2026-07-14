@@ -20,9 +20,10 @@ name = "mkpex"          # `mkpex <input> -o <output.pex> --manifest <caps.toml>`
 path = "src/mkpex.rs"
 
 [dependencies]
-abi = { path = "../abi" }          # shares the .pex format definitions with the kernel loader
-# host tool — std allowed; add ELF-reading + serialization deps here as the format solidifies
-# (e.g. object, goblin) — left minimal until the .pex format is nailed down in P6.
+abi = { path = "../abi" } # shares the .pex format definitions with the kernel loader
+# ELF reader (P7b): parse a compiled refproc's PT_LOAD program headers into .pex segments. Minimal
+# read-only ELF feature set — mkpex is a host tool, so std is fine.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"

@@ -1,22 +1,29 @@
-# refproc — v1 reference userspace processes (P7).
+# refproc — v1 reference userspace processes (P7b). DETACHED workspace (the empty [workspace]
+# below, like fuzz/) so it never perturbs the main workspace's host builds / build-std / -D
+# warnings gates. xtask builds it standalone for a bare-metal *userspace* target with a low-VA
+# linker script + build-std, then packages each binary to a .pex via tools/mkpex.
 #
-# These are the two (or more) isolated userspace processes that communicate via capability IPC
-# to prove the ADR-0001 thesis end-to-end (the v1 finish line, DEC-013). They build against the
-# shared `abi` crate only — a userspace process has no business depending on kernel internals;
-# it talks to the kernel exclusively through the ABI (capability invocations). Compiled to the
-# .pex format by `tools`, staged by `xtask`.
-
+# A userspace process talks to the kernel ONLY through the shared `abi` crate (capability
+# invocations) — it has no business depending on kernel internals. Soft-float (the kernel context
+# switch preserves no FP/SIMD; userspace FP save/restore is a post-v1 gate).
 [package]
-name         = "refproc"
-version      = "0.0.1"
-edition.workspace    = true
-license.workspace    = true
-authors.workspace    = true
-repository.workspace = true
-description  = "Praesidium v1 reference userspace processes — prove capability IPC + isolation (P7)."
+name = "refproc"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Antonio (architect)"]
+repository = "https://github.com/amorgado19/praesidium"
+description = "Praesidium v1 reference userspace processes — prove capability IPC + isolation (P7b)."
+publish = false
 
-# Two minimal processes: a 'ping' and a 'pong' that round-trip a message over a capability
-# endpoint and demonstrate they cannot read each other's memory. Each is its own tiny binary.
+# Shared no_std runtime (syscall stub, exit, panic handler) for the reference binaries.
+[lib]
+name = "refproc"
+path = "src/lib.rs"
+
+# Two minimal processes: `ping` sends over a capability endpoint, `pong` receives + replies; they
+# demonstrate cross-process capability IPC (AC7.2) and, in P7b-ii, that they cannot read each
+# other's memory (AC7.3). Each is its own tiny native binary, packaged to a `.pex`.
 [[bin]]
 name = "ping"
 path = "src/ping.rs"
@@ -26,8 +33,17 @@ name = "pong"
 path = "src/pong.rs"
 
 [dependencies]
-abi = { path = "../abi" }          # userspace touches the kernel ONLY through the ABI
-log.workspace = true
+abi = { path = "../abi" } # userspace touches the kernel ONLY through the ABI
+
+# no_std userspace: no unwinding runtime — a panic aborts (the panic handler exits the process).
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+opt-level = "s"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
+
+# Detached from the main workspace (see header) — must be last.
+[workspace]

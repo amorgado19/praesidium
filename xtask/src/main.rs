@@ -249,6 +249,10 @@ const USER_REQUIRED: &[&str] = &[
     "process exited (code 0)",        // clean exit via a capability invocation
     "EL0 fault CONTAINED",            // an EL0 raw read of a supervisor page killed the process, kernel survived
     "PRAESIDIUM-P7A-OK",
+    // P7b (i.1): the REAL refproc ping.pex — compiled userspace binary, loaded + run at EL0.
+    "ping.pex loaded",                    // the loader accepted the real .pex + minted its manifest caps
+    "EL0 syscall DEBUG value=0x50494e47", // ping ("PING") ran real native code + a capability-mediated syscall
+    "PRAESIDIUM-P7B-I1-OK",
 ];
 
 const SCENARIOS: &[Scenario] = &[
@@ -304,7 +308,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "user",
         required: USER_REQUIRED,
         forbidden: FORBIDDEN,
-        success: "PRAESIDIUM-P7A-OK",
+        success: "PRAESIDIUM-P7B-I1-OK",
     },
 ];
 
@@ -425,12 +429,19 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
 fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     let root = workspace_root();
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+
+    // P7b: build + package the refproc userspace binaries FIRST, so the kernel can `include_bytes!`
+    // their `.pex` images (there is no FS; Warden hands empty modules — embed them in the image).
+    let ping_pex = build_refproc(arch, "ping", "send", "0x91")?;
+
     eprintln!(
         "[xtask] building kernel for {} ({})",
         arch.name, arch.target
     );
     let status = Command::new(&cargo)
         .current_dir(&root)
+        // The kernel `include_bytes!(env!("PRAESIDIUM_PING_PEX"))` the packaged refproc image.
+        .env("PRAESIDIUM_PING_PEX", &ping_pex)
         .args([
             "build",
             // build-std is passed here (not in .cargo/config.toml) so it applies only to the
@@ -459,6 +470,97 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
         ));
     }
     Ok(elf)
+}
+
+/// Build a refproc userspace binary `bin` for `arch` (P7b) with the low-VA userspace linker script
+/// + build-std, then package the ELF into a `.pex` via `tools/mkpex`. Returns the `.pex` path,
+/// which `build_kernel` feeds to the kernel via `PRAESIDIUM_*_PEX` for `include_bytes!`.
+///
+/// The userspace `RUSTFLAGS` override the kernel's high-half config (env takes precedence over the
+/// `.cargo/config.toml` target rustflags) so refproc links into the process window [1 GiB, 2 GiB)
+/// with `code-model=small` on x86 (the base is low, not the kernel's -2 GiB half). refproc is a
+/// DETACHED workspace, so it has its own `refproc/target`.
+fn build_refproc(
+    arch: &ArchSpec,
+    bin: &str,
+    ep_rights: &str,
+    badge: &str,
+) -> Result<PathBuf, String> {
+    let root = workspace_root();
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let ld = root.join("refproc/linker-user.ld");
+    let mut rustflags = format!("-C relocation-model=static -C link-arg=-T{}", ld.display());
+    if arch.name == "x86_64" {
+        rustflags.push_str(" -C code-model=small");
+    }
+    eprintln!(
+        "[xtask] building refproc/{bin} for {} ({})",
+        arch.name, arch.target
+    );
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .env("RUSTFLAGS", &rustflags)
+        .args([
+            "build",
+            "--manifest-path",
+            "refproc/Cargo.toml",
+            "--release",
+            "--target",
+            arch.target,
+            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--bin",
+            bin,
+        ])
+        .status()
+        .map_err(|e| format!("failed to run cargo (refproc): {e}"))?;
+    if !status.success() {
+        return Err(format!("refproc/{bin} build failed for {}", arch.name));
+    }
+    let elf = root
+        .join("refproc/target")
+        .join(arch.target)
+        .join("release")
+        .join(bin);
+    if !elf.exists() {
+        return Err(format!("refproc artifact missing: {}", elf.display()));
+    }
+
+    // Package ELF -> .pex via mkpex (host tool; a workspace member).
+    let pex_dir = root.join("target/pex");
+    fs::create_dir_all(&pex_dir).map_err(|e| format!("mkdir {}: {e}", pex_dir.display()))?;
+    let pex = pex_dir.join(format!("{bin}-{}.pex", arch.name));
+    let elf_s = elf.to_str().ok_or("refproc elf path not UTF-8")?;
+    let pex_s = pex.to_str().ok_or("pex path not UTF-8")?;
+    eprintln!("[xtask] packaging refproc/{bin} -> {}", pex.display());
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "tools",
+            "--release",
+            "--bin",
+            "mkpex",
+            "--",
+            "--arch",
+            arch.name,
+            "--in",
+            elf_s,
+            "-o",
+            pex_s,
+            "--endpoint-rights",
+            ep_rights,
+            "--badge",
+            badge,
+        ])
+        .status()
+        .map_err(|e| format!("failed to run mkpex: {e}"))?;
+    if !status.success() {
+        return Err(format!("mkpex failed for refproc/{bin} ({})", arch.name));
+    }
+    Ok(pex)
 }
 
 // --------------------------------------------------------------------------

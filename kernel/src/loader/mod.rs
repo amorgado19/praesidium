@@ -17,7 +17,7 @@ use abi::pex::{
     PERM_W, PERM_X,
 };
 use cap_core::{grant, CSpace, CapError, CapType, Cptr, GrantMode, Rights};
-use mem::frame::pfn_to_phys;
+use mem::frame::{pfn_to_phys, phys_to_pfn};
 
 use crate::arch::{self, Prot};
 use crate::memory;
@@ -107,6 +107,7 @@ pub fn load(
     loader: &mut CSpace<LOADER_SLOTS>,
     proc: &mut CSpace<PROCESS_SLOTS>,
     domain_id: u64,
+    user_accessible: bool,
 ) -> Result<Loaded, LoadError> {
     let pex = Pex::parse(image, arch::PEX_ARCH)?;
     let mut scratch = L_SCRATCH;
@@ -164,10 +165,19 @@ pub fn load(
 
         let prot = perm_to_prot(s.perm);
         for k in 0..u64::from(pages) {
+            let va = s.vaddr + k * 0x1000;
+            let pa = pfn_to_phys(base_pfn + k as u32);
             // SAFETY: map owned, in-range frames at the process's declared vaddr (confined to the
-            // reserved window above) with W^X `prot`; this shadows only an unused identity-alias VA.
+            // reserved window above) with W^X `prot`. A runnable userspace process
+            // (`user_accessible`) gets EL0/user-reachable pages (kernel/HHDM stay supervisor-only);
+            // the P6 in-kernel loader check maps supervisor-only (it never enters EL0). This
+            // shadows only an unused identity-alias VA.
             unsafe {
-                arch::map_page(s.vaddr + k * 0x1000, pfn_to_phys(base_pfn + k as u32), prot);
+                if user_accessible {
+                    arch::map_user_page(va, pa, prot);
+                } else {
+                    arch::map_page(va, pa, prot);
+                }
             }
         }
         seg_frames[i] = Some(frame_slot);
@@ -233,6 +243,41 @@ pub fn occupied_slots(proc: &CSpace<PROCESS_SLOTS>) -> usize {
     (0..PROCESS_SLOTS)
         .filter(|&s| proc.resolve(s).is_ok())
         .count()
+}
+
+/// Frame-zeroing hook for loader CSpaces (RETYPE zeroes objects before they are observable —
+/// CAP-MEM-2), through the HHDM. Receives `(objref = frame number, frames)`.
+pub(crate) fn zero_frames(frame: u64, frames: u32) {
+    for i in 0..u64::from(frames) {
+        memory::zero_frame(pfn_to_phys((frame + i) as u32));
+    }
+}
+
+fn fatal(msg: &str) -> ! {
+    kprintln!("[praesidium] FATAL: loader: {msg}");
+    arch::halt();
+}
+
+fn fatal_cap(what: &str, e: CapError) -> ! {
+    kprintln!("[praesidium] FATAL: loader: {what}: {e:?}");
+    arch::halt();
+}
+
+/// Build a loader **authority** CSpace: primordial `Untyped` (buddy-carved), a root `Sched`, and a
+/// badged `Endpoint` at the fixed authority slots — the authority the loader derives a process's
+/// manifest capabilities from (a loader can only grant a subset of what it holds; CAP-RUST-1). The
+/// `Endpoint` it retypes here is the object two processes share for cross-process IPC: load both
+/// from the SAME authority and each gets a badged derivation of this one Endpoint (P7b AC7.2).
+/// Reused by the P6 in-kernel demo and the P7b process runner.
+pub fn authority() -> CSpace<LOADER_SLOTS> {
+    let phys = memory::alloc_frames(6).unwrap_or_else(|| fatal("no frames for loader Untyped"));
+    let base = u64::from(phys_to_pfn(phys));
+    let mut cs = CSpace::<LOADER_SLOTS>::new(zero_frames);
+    cs.set_root_untyped(base, 64);
+    cs.set_root_sched(L_SCHED, 1000, 1000);
+    cs.retype(L_UNTYPED, CapType::Endpoint, 1, 1, L_ENDPOINT)
+        .unwrap_or_else(|e| fatal_cap("retype loader Endpoint", e));
+    cs
 }
 
 mod demo;

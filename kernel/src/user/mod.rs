@@ -58,8 +58,17 @@ pub const EP_SLOT: Cptr = 1;
 const EP_BADGE: u64 = 0xB1;
 /// Slots in the transient in-kernel authority CSpace (an Untyped + the Endpoint it retypes).
 const AUTH_SLOTS: usize = 4;
-/// Slots in the bring-up process's CSpace (it holds exactly one capability).
-const PROC_SLOTS: usize = 4;
+/// Slots in a process's CSpace — the loader's `PROCESS_SLOTS`, so a loaded `.pex`'s CSpace and the
+/// P7a bring-up CSpace share one concrete size (the syscall dispatch resolves cptrs against `PROC_CS`).
+const PROC_SLOTS: usize = crate::loader::PROCESS_SLOTS;
+
+/// The P7b `refproc` ping `.pex` — a real compiled userspace binary, packaged by `tools/mkpex` and
+/// embedded at kernel build time by xtask (which sets `PRAESIDIUM_PING_PEX` to the arch image).
+const PING_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PING_PEX"));
+/// The refproc's user stack VA — a page in the process window above ping's segments (0x4010_0000).
+const PING_STACK_VA: u64 = 0x4012_0000;
+/// The isolation domain assigned to the ping process (enforced in P7b-ii; recorded now).
+const DOMAIN_PING: u64 = 0x71;
 
 fn fatal(msg: &str) -> ! {
     kprintln!("[praesidium] FATAL: user: {msg}");
@@ -246,4 +255,64 @@ pub fn run() {
     kprintln!("[praesidium] user: EL0 fault CONTAINED — supervisor page unreadable from EL0, process killed, kernel survives");
 
     kprintln!("[praesidium] PRAESIDIUM-P7A-OK");
+}
+
+fn fatal_load(msg: &str, e: crate::loader::LoadError) -> ! {
+    kprintln!("[praesidium] FATAL: user: {msg}: {e:?}");
+    arch::halt();
+}
+
+/// P7b (i.1): load the real `refproc` ping `.pex` — a compiled NATIVE userspace binary — run it at
+/// EL0/ring-3, and service its capability-mediated syscall. This replaces the P7a in-kernel
+/// bring-up blob with the real toolchain: the loader maps ping's segments (user-accessible, W^X)
+/// and mints EXACTLY its manifest capabilities (a `Sched` budget + a badged `Endpoint` with `SEND`)
+/// into its CSpace; we map a user stack and drop to its entry. Emits `PRAESIDIUM-P7B-I1-OK`.
+pub fn run_pex() {
+    kprintln!("[praesidium] user: P7b — loading refproc ping.pex (real userspace binary)");
+    if !arch::el0_supported() {
+        kprintln!("[praesidium] user: EL0 not wired on this arch — skipping refproc");
+        return;
+    }
+
+    // Derive ping's exact manifest caps from a loader authority (a loader can only grant a subset
+    // of what it holds — no ambient authority, AC6.4). The `.pex` is HOSTILE input: the fuzzed
+    // parser + the loader fail closed on any malformed/over-reaching image.
+    let mut loader = crate::loader::authority();
+    let mut proc = CSpace::<PROC_SLOTS>::new(crate::loader::zero_frames);
+    let loaded = crate::loader::load(PING_PEX, &mut loader, &mut proc, DOMAIN_PING, true)
+        .unwrap_or_else(|e| fatal_load("refproc ping.pex failed to load", e));
+    kprintln!(
+        "[praesidium] user: ping.pex loaded — entry {:#x}, budget {}, {} manifest caps (AC6.4)",
+        loaded.entry,
+        loaded.budget,
+        crate::loader::occupied_slots(&proc)
+    );
+
+    // Map a user stack (the loader maps segments but not a stack).
+    let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for refproc stack"));
+    // SAFETY: map an owned frame RW + EL0-accessible at the process's stack VA (in the reserved
+    // window, disjoint from ping's segments).
+    unsafe {
+        arch::map_user_page(PING_STACK_VA, stack_phys, arch::Prot::Rw);
+    }
+    let stack_top = PING_STACK_VA + PAGE as u64;
+
+    // Bind ping's CSpace as the current process (the EL0 syscall handler resolves cptrs against it),
+    // then run it as a scheduler task that drops to EL0 at its entry.
+    *PROC_CS.lock() = Some(proc);
+    USER_DONE.store(false, Ordering::Release);
+    EXIT_CODE.store(0, Ordering::Relaxed);
+    scheduler::spawn(
+        // SAFETY: `loaded.entry` is loader-mapped EL0-executable code and `stack_top` the top of an
+        // EL0-writable stack page.
+        move || unsafe { arch::enter_user(loaded.entry, stack_top) },
+        cap_core::Budget::new(u32::MAX, u32::MAX),
+    );
+    while !USER_DONE.load(Ordering::Acquire) {
+        scheduler::yield_now();
+    }
+    if EXIT_CODE.load(Ordering::Relaxed) != 0 {
+        fatal("refproc ping did not exit cleanly");
+    }
+    kprintln!("[praesidium] PRAESIDIUM-P7B-I1-OK");
 }

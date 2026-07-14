@@ -115,7 +115,7 @@ pub fn run() {
     let mut proc = CSpace::<PROCESS_SLOTS>::new(zero_frames);
 
     // AC6.3: load — mint exactly the manifest caps (monotonic), map W^X segments, bind Sched.
-    let loaded = load(&image, &mut loader, &mut proc, 0x50)
+    let loaded = load(&image, &mut loader, &mut proc, 0x50, false)
         .unwrap_or_else(|e| fatal_load("valid .pex failed to load", e));
     kprintln!(
         "[praesidium] loader: .pex loaded — entry {:#x}, budget {}, domain {:#x} (AC6.2/6.3)",
@@ -200,7 +200,7 @@ pub fn run() {
     let mut bad = build_pex();
     bad[0] ^= 0xff; // corrupt the magic
     let mut throwaway = CSpace::<PROCESS_SLOTS>::new(zero_frames);
-    match load(&bad, &mut loader, &mut throwaway, 0x51) {
+    match load(&bad, &mut loader, &mut throwaway, 0x51, false) {
         Err(LoadError::Pex(_)) => {}
         _ => fatal("a malformed .pex was not refused"),
     }
