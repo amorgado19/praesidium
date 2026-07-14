@@ -55,6 +55,11 @@ struct Task {
     /// The task body, taken and run by [`task_enter`] on first schedule. `Send` because the
     /// scheduler is a `static` shared with the timer ISR.
     body: Option<Box<dyn FnOnce() + Send>>,
+    /// Which userspace process this task runs, if any (P7b): the index into `crate::user`'s process
+    /// registry. The EL0/ring-3 syscall handler reads [`current_proc_id`] to resolve invoked cptrs
+    /// against the CURRENT process's CSpace — the per-Task binding that generalises the single
+    /// bring-up CSpace. `None` for kernel tasks (the idle/boot task, the hog, the executor).
+    proc_id: Option<usize>,
 }
 
 struct Scheduler {
@@ -109,6 +114,7 @@ pub fn bootstrap() {
         budget: Budget::new(u32::MAX, u32::MAX), // the idle task always has budget
         state: State::Runnable,
         body: None,
+        proc_id: None,
     });
     let mut g = SCHED.lock();
     *g = Some(Scheduler {
@@ -117,9 +123,19 @@ pub fn bootstrap() {
     });
 }
 
-/// Spawn a runnable task with `body` and CPU-time `budget`. Allocates a fresh kernel stack and
-/// primes its context so the first schedule lands in the task body.
+/// Spawn a runnable kernel task with `body` and CPU-time `budget` (no bound userspace process).
 pub fn spawn(body: impl FnOnce() + Send + 'static, budget: Budget) {
+    spawn_inner(body, budget, None);
+}
+
+/// Spawn a runnable task bound to userspace process `proc_id` (P7b): the EL0/ring-3 syscall handler
+/// resolves this task's invoked cptrs against that process's CSpace (see [`current_proc_id`]).
+pub fn spawn_proc(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: usize) {
+    spawn_inner(body, budget, Some(proc_id));
+}
+
+/// Allocate a guarded kernel stack, prime the initial context, and enqueue a new runnable task.
+fn spawn_inner(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: Option<usize>) {
     // Allocate the whole guarded block; the usable stack occupies its top `STACK_BYTES`, with a
     // guard frame directly below the stack's lowest byte.
     let block = memory::alloc_frames(GUARDED_STACK_ORDER)
@@ -143,8 +159,16 @@ pub fn spawn(body: impl FnOnce() + Send + 'static, budget: Budget) {
         budget,
         state: State::Runnable,
         body: Some(Box::new(body)),
+        proc_id,
     });
     with_sched(|s| s.tasks.push(task));
+}
+
+/// The userspace process bound to the currently-running task, or `None` for a kernel task. Read by
+/// the EL0/ring-3 syscall handler to resolve invoked cptrs against the right process's CSpace (P7b).
+#[must_use]
+pub fn current_proc_id() -> Option<usize> {
+    with_sched(|s| s.tasks[s.current].proc_id)
 }
 
 /// Cooperatively yield the CPU: pick the next runnable task and switch to it. Returns when this

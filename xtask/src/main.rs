@@ -249,10 +249,13 @@ const USER_REQUIRED: &[&str] = &[
     "process exited (code 0)",        // clean exit via a capability invocation
     "EL0 fault CONTAINED",            // an EL0 raw read of a supervisor page killed the process, kernel survived
     "PRAESIDIUM-P7A-OK",
-    // P7b (i.1): the REAL refproc ping.pex — compiled userspace binary, loaded + run at EL0.
+    // P7b (i.2): TWO REAL refproc binaries (ping + pong), loaded + run concurrently at EL0, each
+    // resolving its own caps via the per-Task CSpace binding.
     "ping.pex loaded",                    // the loader accepted the real .pex + minted its manifest caps
+    "pong.pex loaded",
     "EL0 syscall DEBUG value=0x50494e47", // ping ("PING") ran real native code + a capability-mediated syscall
-    "PRAESIDIUM-P7B-I1-OK",
+    "EL0 syscall DEBUG value=0x504f4e47", // pong ("PONG")
+    "PRAESIDIUM-P7B-I2-OK",
 ];
 
 const SCENARIOS: &[Scenario] = &[
@@ -308,7 +311,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "user",
         required: USER_REQUIRED,
         forbidden: FORBIDDEN,
-        success: "PRAESIDIUM-P7B-I1-OK",
+        success: "PRAESIDIUM-P7B-I2-OK",
     },
 ];
 
@@ -432,7 +435,10 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
 
     // P7b: build + package the refproc userspace binaries FIRST, so the kernel can `include_bytes!`
     // their `.pex` images (there is no FS; Warden hands empty modules — embed them in the image).
-    let ping_pex = build_refproc(arch, "ping", "send", "0x91")?;
+    // ping (SEND) and pong (SEND+RECV) link at distinct bases so they coexist in the shared address
+    // space; both share ONE Endpoint (the loader derives each cap from one authority) for AC7.2 IPC.
+    let ping_pex = build_refproc(arch, "ping", "send", "0x91", None)?;
+    let pong_pex = build_refproc(arch, "pong", "sendrecv", "0x92", Some("0x40300000"))?;
 
     eprintln!(
         "[xtask] building kernel for {} ({})",
@@ -440,8 +446,9 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     );
     let status = Command::new(&cargo)
         .current_dir(&root)
-        // The kernel `include_bytes!(env!("PRAESIDIUM_PING_PEX"))` the packaged refproc image.
+        // The kernel `include_bytes!(env!("PRAESIDIUM_{PING,PONG}_PEX"))` the packaged refproc images.
         .env("PRAESIDIUM_PING_PEX", &ping_pex)
+        .env("PRAESIDIUM_PONG_PEX", &pong_pex)
         .args([
             "build",
             // build-std is passed here (not in .cargo/config.toml) so it applies only to the
@@ -485,11 +492,16 @@ fn build_refproc(
     bin: &str,
     ep_rights: &str,
     badge: &str,
+    base: Option<&str>,
 ) -> Result<PathBuf, String> {
     let root = workspace_root();
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let ld = root.join("refproc/linker-user.ld");
     let mut rustflags = format!("-C relocation-model=static -C link-arg=-T{}", ld.display());
+    // A distinct link base per process so two coexist in the shared address space (P7b i.2+).
+    if let Some(b) = base {
+        rustflags.push_str(&format!(" -C link-arg=--defsym=__base={b}"));
+    }
     if arch.name == "x86_64" {
         rustflags.push_str(" -C code-model=small");
     }

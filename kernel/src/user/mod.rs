@@ -1,74 +1,79 @@
-//! Userspace bring-up (P7a): drop to EL0/ring-3, run real native code, and service its syscall
-//! trap — the transport half of the v1 thesis (ADR-0001 / ADR-0006). The **mechanism** (the
-//! privilege drop, the trap vector/stub, the register save/restore) lives behind the arch seam;
-//! this module holds the **arch-generic policy**: it lays out a process's user-accessible pages,
-//! runs it as a scheduler task, and dispatches its syscalls. A process is isolated from the kernel
-//! by page permission alone — its segments are mapped EL0-accessible, everything else (the HHDM,
-//! the kernel image) stays supervisor-only, so an EL0 raw pointer into kernel memory faults.
-//!
-//! **No ambient authority (SPEC-CAP RI).** Every EL0 syscall is a capability invocation: the trap
-//! decodes an [`abi::invoke::Invocation`] and dispatches it through the P6 [`crate::syscall::invoke`]
-//! (resolve cptr → rights-check → act) — the trap the P6 phase *shaped*, now *fired*. The bring-up
-//! process is granted, **in-kernel**, exactly the one capability it needs — a badged `Endpoint`
-//! with `SEND` — so even DEBUG/EXIT are capability-gated (they require that cap), not ambient.
-//!
-//! P7a proves this with two in-kernel bring-up blobs: one makes capability-mediated syscalls and
-//! exits cleanly; one raw-reads a supervisor page and is KILLED (the kernel survives — a taste of
-//! the AC7.3 isolation payoff). The real `refproc` `.pex` processes + cross-process IPC + the full
-//! isolation red-team are P7b.
+//! Userspace processes — P7a EL0/ring-3 transport + P7b multi-process. Drop to EL0/ring-3, run real
+//! native code, service capability-mediated syscalls, and (P7b) run TWO real `.pex` processes at
+//! once. The **mechanism** (privilege drop, trap stub, register save/restore) lives behind the arch
+//! seam; this module is the **arch-generic policy**: it lays out each process's user-accessible
+//! pages, runs it as a scheduler task, resolves its syscalls against ITS OWN CSpace (a per-Task
+//! binding, keyed by the running task's `proc_id`), and dispatches through the P6
+//! [`crate::syscall::invoke`] (resolve cptr → rights-check → act) — no ambient authority
+//! (SPEC-CAP RI). A process is isolated from the kernel by page permission (its segments are
+//! EL0-accessible; kernel/HHDM stay supervisor-only); process-vs-process isolation is P7b-ii.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use abi::invoke::{op, Invocation};
-use cap_core::{grant, CSpace, CapError, CapType, Cptr, GrantMode, Rights};
+use cap_core::{grant, Budget, CSpace, CapError, CapType, Cptr, GrantMode, Rights};
 use mem::frame::{pfn_to_phys, phys_to_pfn};
 
 use crate::sched::scheduler;
 use crate::sync::SpinLock;
 use crate::{arch, memory};
 
-/// Set by [`syscall`]/[`fault`] when the running bring-up process leaves EL0, so [`run_el0_process`]
-/// knows to stop. `EXIT_CODE` carries the process's exit code (or `u64::MAX`, the killed sentinel).
-static USER_DONE: AtomicBool = AtomicBool::new(false);
-static EXIT_CODE: AtomicU64 = AtomicU64::new(0);
+/// Max concurrent userspace processes (P7b runs 2: ping + pong).
+const MAX_PROCS: usize = 4;
+/// Process CSpace size — the loader's `PROCESS_SLOTS`, so loaded `.pex` and bring-up CSpaces match.
+const PROC_SLOTS: usize = crate::loader::PROCESS_SLOTS;
+/// The loader authority CSpace size (for [`load_process`]'s `loader` parameter).
+const LOADER_SLOTS: usize = crate::loader::LOADER_SLOTS;
 
-/// The bring-up process's CSpace: it holds **exactly one** capability (a badged `Endpoint` with
-/// `SEND`, granted in-kernel by [`setup_process_cspace`]). The EL0 syscall dispatch resolves the
-/// invoked cptr against this — the "current process" a real per-Task CSpace binding generalises in
-/// P7b. Read-only after setup; the lock is dropped before any divergence ([`scheduler::exit_current`]
-/// never returns, so a held guard would leak / deadlock).
-static PROC_CS: SpinLock<Option<CSpace<PROC_SLOTS>>> = SpinLock::new(None);
+/// Per-process CSpaces — the EL0/ring-3 syscall handler resolves invoked cptrs against the CURRENT
+/// process's CSpace, indexed by the running task's `proc_id` ([`scheduler::current_proc_id`]). This
+/// per-Task binding generalises P7a's single bring-up CSpace. The lock is dropped before any
+/// divergence ([`scheduler::exit_current`] never returns, so a held guard would deadlock the next).
+static PROC_CSPACES: SpinLock<[Option<CSpace<PROC_SLOTS>>; MAX_PROCS]> =
+    SpinLock::new([None, None, None, None]);
+/// Per-process exit signal (set by a process's own syscall/fault, polled by the boot task's drive
+/// loop). Atomics — NOT under `PROC_CSPACES` — so a `PROC_EXIT`/fault can signal + `exit_current`
+/// without holding a lock.
+static PROC_DONE: [AtomicBool; MAX_PROCS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+/// Per-process exit code (or `u64::MAX`, the killed sentinel).
+static PROC_EXIT: [AtomicU64; MAX_PROCS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
-/// Virtual addresses for the bring-up process, inside the reserved process window `[1 GiB, 2 GiB)`
-/// (`loader::PROC_VA_BASE`). Code and stack are one page each; reused across the two bring-up
-/// processes (they run one at a time).
+// ---- P7a in-kernel bring-up blob VAs (the transport + fault-kill regression) ----
 const USER_CODE_VA: u64 = 0x4010_0000;
 const USER_STACK_VA: u64 = 0x4011_0000;
 /// A **supervisor-only** probe page (mapped via [`arch::map_page`], no user access) the fault
-/// bring-up process reads to trigger a userspace permission fault. `pub` so the arch fault blobs
-/// can name it (a `const` operand); the aarch64 blob hardcodes it (`0x4012_0000`) via `movz` — keep
-/// them in sync. x86-64 references this const directly.
+/// bring-up blob reads to trigger a userspace permission fault. `pub` so the arch fault blobs can
+/// name it (a `const` operand); the aarch64 blob hardcodes it (`0x4012_0000`) via `movz`.
 pub const FAULT_PROBE_VA: u64 = 0x4012_0000;
 const PAGE: usize = 4096;
 
-/// The CSpace slot holding the process's one capability (its bring-up-service `Endpoint`). `pub`
-/// so the arch EL0 blob can name it as the invoked cptr (a `const` operand in its `global_asm!`).
+/// The CSpace slot holding the P7a bring-up blob's `Endpoint` cap. `pub` so the arch blob names it.
 pub const EP_SLOT: Cptr = 1;
-/// The badge the kernel stamps on the bring-up Endpoint (identifies the sender — DEC-0006-3).
 const EP_BADGE: u64 = 0xB1;
-/// Slots in the transient in-kernel authority CSpace (an Untyped + the Endpoint it retypes).
 const AUTH_SLOTS: usize = 4;
-/// Slots in a process's CSpace — the loader's `PROCESS_SLOTS`, so a loaded `.pex`'s CSpace and the
-/// P7a bring-up CSpace share one concrete size (the syscall dispatch resolves cptrs against `PROC_CS`).
-const PROC_SLOTS: usize = crate::loader::PROCESS_SLOTS;
 
-/// The P7b `refproc` ping `.pex` — a real compiled userspace binary, packaged by `tools/mkpex` and
-/// embedded at kernel build time by xtask (which sets `PRAESIDIUM_PING_PEX` to the arch image).
+// ---- P7b reference processes (real .pex, embedded by xtask) ----
 const PING_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PING_PEX"));
-/// The refproc's user stack VA — a page in the process window above ping's segments (0x4010_0000).
-const PING_STACK_VA: u64 = 0x4012_0000;
-/// The isolation domain assigned to the ping process (enforced in P7b-ii; recorded now).
+const PONG_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PONG_PEX"));
+/// User-stack VAs (one page each), distinct from the processes' segments (ping @ 0x4010_0000, pong
+/// @ 0x4030_0000) and each other — all inside the reserved window [1 GiB, 2 GiB).
+const PING_STACK_VA: u64 = 0x4020_0000;
+const PONG_STACK_VA: u64 = 0x4040_0000;
 const DOMAIN_PING: u64 = 0x71;
+const DOMAIN_PONG: u64 = 0x72;
+/// Process indices — a process's scheduler `proc_id` and its registry slot.
+const PING: usize = 0;
+const PONG: usize = 1;
 
 fn fatal(msg: &str) -> ! {
     kprintln!("[praesidium] FATAL: user: {msg}");
@@ -80,6 +85,11 @@ fn fatal_cap(what: &str, e: CapError) -> ! {
     arch::halt();
 }
 
+fn fatal_load(msg: &str, e: crate::loader::LoadError) -> ! {
+    kprintln!("[praesidium] FATAL: user: {msg}: {e:?}");
+    arch::halt();
+}
+
 /// Frame-zeroing hook for the bring-up CSpaces (RETYPE zeroes objects before they are observable —
 /// CAP-MEM-2), through the HHDM. Receives `(objref = frame number, frames)`.
 fn zero_frames(frame: u64, frames: u32) {
@@ -88,14 +98,72 @@ fn zero_frames(frame: u64, frames: u32) {
     }
 }
 
-/// Build the bring-up process's minimal CSpace: **exactly one** capability — a badged `Endpoint`
-/// with `SEND` — derived monotonically from a transient in-kernel authority (an `Untyped` we
-/// carve an `Endpoint` from, then MINT-grant into the process). This is deliberately NOT the
-/// `.pex` manifest→loader pipeline (that packages real userspace programs — P7b); P7a grants the
-/// one cap the transport proof needs directly. The process's DEBUG/EXIT syscalls are invocations
-/// on this cap, so no EL0 authority is ambient (SPEC-CAP RI).
-fn setup_process_cspace() {
-    let ut_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for bring-up authority"));
+/// Signal process `id` done with exit `code`, then retire its task (never returns). `PROC_DONE` is
+/// set with `Release` so the boot task's drive loop observes the code; the task is abandoned.
+fn retire(id: usize, code: u64) -> ! {
+    PROC_EXIT[id].store(code, Ordering::Relaxed);
+    PROC_DONE[id].store(true, Ordering::Release);
+    scheduler::exit_current();
+}
+
+/// Dispatch an EL0 syscall (called by the arch trap handler with the [`Invocation`] decoded from
+/// the register ABI). Resolves + rights-checks the cptr against the CURRENT process's CSpace via
+/// the P6 [`crate::syscall::invoke`] — no held capability ⇒ refused, no ambient path. On success
+/// the *effect* is applied here (a divergent exit cannot be expressed through the value-returning
+/// dispatch): `DEBUG_EMIT` logs; `PROC_EXIT` retires the process; any other op returns its result.
+// Called by the arch EL0/ring-3 syscall trap handlers (both arches).
+pub fn syscall(inv: &Invocation) -> u64 {
+    let id = scheduler::current_proc_id()
+        .unwrap_or_else(|| fatal("EL0 syscall from a task that is not a userspace process"));
+    // Release the CSpace lock BEFORE any divergence (`exit_current` never returns).
+    let result = {
+        let g = PROC_CSPACES.lock();
+        let cs = g[id]
+            .as_ref()
+            .unwrap_or_else(|| fatal("EL0 syscall before the process CSpace exists"));
+        crate::syscall::invoke(cs, inv)
+    };
+    match result {
+        Ok(v) => match inv.op {
+            op::DEBUG_EMIT => {
+                kprintln!("[praesidium] user: EL0 syscall DEBUG value={v:#x}");
+                0
+            }
+            op::PROC_EXIT => {
+                kprintln!("[praesidium] user: process exited (code {v})");
+                retire(id, v);
+            }
+            // A real capability op (CAP_IDENTIFY / FRAME_PROBE / ENDPOINT_SEND): return its result.
+            _ => v,
+        },
+        Err(e) => {
+            // A refusal from a (trusted) reference process is a bug. Fail closed — kill the process
+            // (the kernel survives), exactly as an unexpected fault would.
+            kprintln!("[praesidium] user: EL0 invocation refused ({e:?}) — killing the process, kernel survives");
+            retire(id, u64::MAX);
+        }
+    }
+}
+
+/// Handle a userspace fault (an EL0 access that trapped — a bug or a hostile raw pointer). The
+/// **current process** is killed, not the kernel; the kernel keeps running. Never returns.
+// Called by the arch EL0/ring-3 trap handlers (both arches) on a userspace fault.
+pub fn fault(kind: &str, addr: u64) -> ! {
+    let id = scheduler::current_proc_id()
+        .unwrap_or_else(|| fatal("EL0 fault from a task that is not a userspace process"));
+    kprintln!("[praesidium] user: EL0 fault ({kind} at {addr:#x}) — killing the process, kernel survives");
+    retire(id, u64::MAX);
+}
+
+// ============================ P7a in-kernel bring-up (transport + fault-kill regression) ===========
+
+/// Build the P7a bring-up blob's CSpace — **exactly one** capability, a badged `Endpoint` with
+/// `SEND`, derived monotonically from a transient in-kernel authority (NOT the `.pex` loader
+/// pipeline) — and register it as process `id`. The blob's DEBUG/EXIT syscalls are invocations on
+/// this cap, so no EL0 authority is ambient (SPEC-CAP RI).
+fn setup_blob_cspace(id: usize) {
+    let ut_phys =
+        memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for bring-up authority"));
     let mut authority = CSpace::<AUTH_SLOTS>::new(zero_frames);
     authority.set_root_untyped(u64::from(phys_to_pfn(ut_phys)), 1);
     authority
@@ -112,72 +180,18 @@ fn setup_process_cspace() {
         GrantMode::Mint,
     )
     .unwrap_or_else(|e| fatal_cap("grant bring-up Endpoint", e));
-    *PROC_CS.lock() = Some(cs);
+    PROC_CSPACES.lock()[id] = Some(cs);
 }
 
-/// Dispatch an EL0 syscall (called by the arch trap handler with the [`Invocation`] decoded from
-/// the register ABI). Resolves + rights-checks the cptr through the P6 [`crate::syscall::invoke`]
-/// — no held capability ⇒ refused, there is no ambient path. On success the *effect* is applied
-/// here (a divergent exit cannot be expressed through the value-returning dispatch): `DEBUG_EMIT`
-/// logs the value; `PROC_EXIT` retires the process; any other op returns its result word to EL0.
-// Called by the arch EL0/ring-3 syscall trap handlers (both arches).
-pub fn syscall(inv: &Invocation) -> u64 {
-    // Release the CSpace lock BEFORE any divergence: `exit_current` never returns, so a held guard
-    // would never drop (deadlocking the next process's access).
-    let result = {
-        let g = PROC_CS.lock();
-        let cs = g
-            .as_ref()
-            .unwrap_or_else(|| fatal("EL0 syscall before the bring-up CSpace exists"));
-        crate::syscall::invoke(cs, inv)
-    };
-    match result {
-        Ok(v) => match inv.op {
-            op::DEBUG_EMIT => {
-                kprintln!("[praesidium] user: EL0 syscall DEBUG value={v:#x}");
-                0
-            }
-            op::PROC_EXIT => {
-                kprintln!("[praesidium] user: process exited (code {v})");
-                EXIT_CODE.store(v, Ordering::Relaxed);
-                USER_DONE.store(true, Ordering::Release);
-                scheduler::exit_current(); // -> ! : retire this process's task, schedule away
-            }
-            // A real capability op (CAP_IDENTIFY / FRAME_PROBE / ENDPOINT_SEND): return its result.
-            _ => v,
-        },
-        Err(e) => {
-            // The trusted bring-up process always holds its cap; a refusal is a bug. Fail closed —
-            // kill the process (the kernel survives), exactly as an unexpected fault would.
-            kprintln!("[praesidium] user: EL0 invocation refused ({e:?}) — killing the process, kernel survives");
-            EXIT_CODE.store(u64::MAX, Ordering::Relaxed);
-            USER_DONE.store(true, Ordering::Release);
-            scheduler::exit_current();
-        }
-    }
-}
-
-/// Handle a userspace fault (an EL0 access that trapped — a bug or a hostile raw pointer). The
-/// **process** is killed, not the kernel; the kernel keeps running. Never returns.
-// Called by the arch EL0/ring-3 trap handlers (both arches) on a userspace fault.
-pub fn fault(kind: &str, addr: u64) -> ! {
-    kprintln!("[praesidium] user: EL0 fault ({kind} at {addr:#x}) — killing the process, kernel survives");
-    EXIT_CODE.store(u64::MAX, Ordering::Relaxed);
-    USER_DONE.store(true, Ordering::Release);
-    scheduler::exit_current();
-}
-
-/// Lay out a bring-up process (copy its native code into an owned frame, make it coherent for
-/// instruction fetch, map code R-X + stack RW EL0-accessible at the process VAs), run it as a
-/// scheduler task that drops to EL0, and drive it cooperatively from the boot task until it leaves
-/// EL0 (a syscall exit or a fault, each of which retires the task). Resets the outcome signals
-/// before spawning; the caller inspects `EXIT_CODE` afterwards.
-fn run_el0_process(blob: &[u8], code_phys: u64, code_va: u64, stack_phys: u64, stack_va: u64) {
+/// Lay out a bring-up blob (copy its native code into an owned frame, make it coherent for
+/// instruction fetch, map code R-X + stack RW EL0-accessible), run it as process `id`'s scheduler
+/// task that drops to EL0, and drive it from the boot task until it leaves EL0.
+fn run_el0_process(blob: &[u8], id: usize, code_phys: u64, code_va: u64, stack_phys: u64, stack_va: u64) {
     assert!(blob.len() <= PAGE, "bring-up blob exceeds a page");
     let code_hhdm = memory::phys_to_virt(code_phys);
     // SAFETY: `code_hhdm` is an HHDM-mapped, writable frame we own; `blob` is a disjoint static
-    // slice. We copy the blob (overwriting any prior process's code — the two run sequentially),
-    // then make the written code coherent for EL0 instruction fetch.
+    // slice. Copy the blob (overwriting any prior blob's code — they run sequentially), then make it
+    // coherent for EL0 instruction fetch.
     unsafe {
         core::ptr::copy_nonoverlapping(blob.as_ptr(), code_hhdm as *mut u8, blob.len());
     }
@@ -189,67 +203,52 @@ fn run_el0_process(blob: &[u8], code_phys: u64, code_va: u64, stack_phys: u64, s
     }
     let stack_top = stack_va + PAGE as u64;
 
-    USER_DONE.store(false, Ordering::Release);
-    EXIT_CODE.store(0, Ordering::Relaxed);
-    scheduler::spawn(
-        // SAFETY: `code_va` maps EL0-executable code (entry at offset 0) and `stack_top` the
-        // exclusive top of an EL0-writable stack page.
+    PROC_DONE[id].store(false, Ordering::Release);
+    PROC_EXIT[id].store(0, Ordering::Relaxed);
+    scheduler::spawn_proc(
+        // SAFETY: `code_va` maps EL0-executable code (entry at offset 0) and `stack_top` the top of
+        // an EL0-writable stack page.
         move || unsafe { arch::enter_user(code_va, stack_top) },
-        cap_core::Budget::new(u32::MAX, u32::MAX),
+        Budget::new(u32::MAX, u32::MAX),
+        id,
     );
-    while !USER_DONE.load(Ordering::Acquire) {
+    while !PROC_DONE[id].load(Ordering::Acquire) {
         scheduler::yield_now();
     }
 }
 
-/// P7a bring-up: prove the EL0 transport end to end.
-///  1. Grant the process its one capability in-kernel (an `Endpoint` with `SEND`).
-///  2. Run a process that makes **capability-mediated** syscalls (`DEBUG_EMIT` then `PROC_EXIT`,
-///     each an invocation resolved + rights-checked by the P6 dispatch) and exits cleanly.
-///  3. Run a process that raw-reads a **supervisor-only** page — it is KILLED, the kernel survives
-///     (a taste of AC7.3: EL0 is isolated from the kernel by page permission alone).
-///
-/// Emits `PRAESIDIUM-P7A-OK` on success.
+/// P7a bring-up: prove the EL0 transport end to end with in-kernel blobs — a capability-mediated
+/// DEBUG/EXIT round-trip, then a supervisor-page raw read that KILLS the process (kernel survives,
+/// a taste of AC7.3). Emits `PRAESIDIUM-P7A-OK`. (Superseded as the transport proof by the real
+/// `.pex` in [`run_processes`], but kept as a regression + the fault-kill demonstration.)
 pub fn run() {
     kprintln!("[praesidium] user: P7a — EL0 userspace transport (ADR-0006 / ADR-0007)");
     if !arch::el0_supported() {
-        // x86-64 ring 3 is a P7a follow-on (the aarch64 EL0 path is validated first). Report the
-        // skip with a distinct headline so the `user` smoke scenario passes cleanly on x86 instead
-        // of failing by construction; this is NOT an EL0 run (see xtask `USER_REQUIRED_X86`).
         kprintln!("[praesidium] user: EL0 userspace not yet wired on x86-64 — ring 3 is a P7a follow-on");
         kprintln!("[praesidium] PRAESIDIUM-P7A-SKIP");
         return;
     }
 
-    // (1) Grant the trusted bring-up process its one capability, so its EL0 syscalls are capability
-    // invocations, never ambient (SPEC-CAP RI).
-    setup_process_cspace();
-
-    // Allocate the code + stack frames ONCE and reuse them for both bring-up processes (they run
-    // strictly one at a time and reuse the same VAs). These two frames — plus the fault probe and
-    // the authority Endpoint frame below, and each task's kernel stack (scheduler, P-later reaper)
-    // — are a small, bounded, one-time bring-up leak: P7a has no process/stack reaper, so real
-    // reclamation lands with process teardown in P7b.
+    setup_blob_cspace(PING);
     let code_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for user code"));
     let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for user stack"));
 
-    // (2) Capability-mediated transport: real EL0 code makes DEBUG_EMIT then PROC_EXIT syscalls,
-    // each resolved + rights-checked through the P6 invoke dispatch. Clean exit (code 0).
-    run_el0_process(arch::el0_test_blob(), code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
-    if EXIT_CODE.load(Ordering::Relaxed) != 0 {
+    // (1) Capability-mediated transport: DEBUG_EMIT then PROC_EXIT, each resolved + rights-checked.
+    run_el0_process(arch::el0_test_blob(), PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
+    if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 {
         fatal("bring-up process did not exit cleanly");
     }
 
-    // (3) Isolation taste: map a supervisor-only page, then run a process that raw-reads it. The
-    // EL0 access faults; the kernel KILLS the process and keeps running.
+    // (2) Isolation taste: a supervisor-only page raw-read from EL0 faults; the kernel kills the
+    // process and keeps running.
     let probe_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for the fault probe"));
-    // SAFETY: map a supervisor-only (no EL0 access) read-only page at `FAULT_PROBE_VA` in the
-    // process window; an EL0 read of it is a permission fault, exercising the kill-process path.
+    // SAFETY: map a supervisor-only (no EL0 access) read-only page at `FAULT_PROBE_VA`; an EL0 read
+    // of it is a permission fault, exercising the kill-process path.
     unsafe {
         arch::map_page(FAULT_PROBE_VA, probe_phys, arch::Prot::Ro);
     }
-    run_el0_process(arch::el0_fault_blob(), code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
-    if EXIT_CODE.load(Ordering::Relaxed) != u64::MAX {
+    run_el0_process(arch::el0_fault_blob(), PING, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
+    if PROC_EXIT[PING].load(Ordering::Relaxed) != u64::MAX {
         fatal("fault process was not killed by the EL0 fault path");
     }
     kprintln!("[praesidium] user: EL0 fault CONTAINED — supervisor page unreadable from EL0, process killed, kernel survives");
@@ -257,62 +256,86 @@ pub fn run() {
     kprintln!("[praesidium] PRAESIDIUM-P7A-OK");
 }
 
-fn fatal_load(msg: &str, e: crate::loader::LoadError) -> ! {
-    kprintln!("[praesidium] FATAL: user: {msg}: {e:?}");
-    arch::halt();
+// ================================ P7b multi-process (real .pex) ====================================
+
+/// Load a real `.pex` as process `id`: derive its EXACTLY-manifest caps from the shared `loader`
+/// authority (no ambient authority, AC6.4; the `.pex` is HOSTILE input — the fuzzed parser + loader
+/// fail closed), register its CSpace, and map a user stack. Returns `(entry, stack_top)` for the
+/// scheduler task that drops to EL0. Both processes load from ONE authority, so they share the one
+/// Endpoint (each a badged derivation) — the substrate for cross-process IPC (AC7.2).
+fn load_process(
+    loader: &mut CSpace<LOADER_SLOTS>,
+    scratch: &mut Cptr,
+    pex: &[u8],
+    domain: u64,
+    id: usize,
+    stack_va: u64,
+    name: &str,
+) -> (u64, u64) {
+    let mut cs = CSpace::<PROC_SLOTS>::new(crate::loader::zero_frames);
+    let loaded = crate::loader::load(pex, loader, &mut cs, domain, true, scratch)
+        .unwrap_or_else(|e| fatal_load("refproc .pex failed to load", e));
+    kprintln!(
+        "[praesidium] user: {name}.pex loaded — entry {:#x}, budget {}, {} manifest caps (AC6.4)",
+        loaded.entry,
+        loaded.budget,
+        crate::loader::occupied_slots(&cs)
+    );
+    let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for refproc stack"));
+    // SAFETY: map an owned frame RW + EL0-accessible at the process's stack VA (in the reserved
+    // window, disjoint from the segments + the other process's pages).
+    unsafe {
+        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw);
+    }
+    PROC_CSPACES.lock()[id] = Some(cs);
+    (loaded.entry, stack_va + PAGE as u64)
 }
 
-/// P7b (i.1): load the real `refproc` ping `.pex` — a compiled NATIVE userspace binary — run it at
-/// EL0/ring-3, and service its capability-mediated syscall. This replaces the P7a in-kernel
-/// bring-up blob with the real toolchain: the loader maps ping's segments (user-accessible, W^X)
-/// and mints EXACTLY its manifest capabilities (a `Sched` budget + a badged `Endpoint` with `SEND`)
-/// into its CSpace; we map a user stack and drop to its entry. Emits `PRAESIDIUM-P7B-I1-OK`.
-pub fn run_pex() {
-    kprintln!("[praesidium] user: P7b — loading refproc ping.pex (real userspace binary)");
+/// P7b (i.2): load the real `refproc` ping + pong `.pex` binaries and run them CONCURRENTLY at
+/// EL0/ring-3, each resolving its OWN capabilities via the per-Task CSpace binding. Both are loaded
+/// from ONE loader authority, so they share the one Endpoint (ping SEND, pong SEND+RECV) — the
+/// substrate for the cross-process IPC round-trip (AC7.2, i.3). Emits `PRAESIDIUM-P7B-I2-OK`.
+pub fn run_processes() {
+    kprintln!("[praesidium] user: P7b — loading refproc ping + pong (real userspace binaries)");
     if !arch::el0_supported() {
         kprintln!("[praesidium] user: EL0 not wired on this arch — skipping refproc");
         return;
     }
 
-    // Derive ping's exact manifest caps from a loader authority (a loader can only grant a subset
-    // of what it holds — no ambient authority, AC6.4). The `.pex` is HOSTILE input: the fuzzed
-    // parser + the loader fail closed on any malformed/over-reaching image.
+    // Both processes load from ONE authority (so they share the one Endpoint) with a SHARED scratch
+    // cursor that advances across loads — each load's retyped segment-frame cap stays in the
+    // authority, so a reset base would collide (LOADER_SLOTS=32 holds both processes' scratch).
     let mut loader = crate::loader::authority();
-    let mut proc = CSpace::<PROC_SLOTS>::new(crate::loader::zero_frames);
-    let loaded = crate::loader::load(PING_PEX, &mut loader, &mut proc, DOMAIN_PING, true)
-        .unwrap_or_else(|e| fatal_load("refproc ping.pex failed to load", e));
-    kprintln!(
-        "[praesidium] user: ping.pex loaded — entry {:#x}, budget {}, {} manifest caps (AC6.4)",
-        loaded.entry,
-        loaded.budget,
-        crate::loader::occupied_slots(&proc)
-    );
+    let mut scratch = crate::loader::L_SCRATCH;
+    let (ping_entry, ping_sp) =
+        load_process(&mut loader, &mut scratch, PING_PEX, DOMAIN_PING, PING, PING_STACK_VA, "ping");
+    let (pong_entry, pong_sp) =
+        load_process(&mut loader, &mut scratch, PONG_PEX, DOMAIN_PONG, PONG, PONG_STACK_VA, "pong");
 
-    // Map a user stack (the loader maps segments but not a stack).
-    let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for refproc stack"));
-    // SAFETY: map an owned frame RW + EL0-accessible at the process's stack VA (in the reserved
-    // window, disjoint from ping's segments).
-    unsafe {
-        arch::map_user_page(PING_STACK_VA, stack_phys, arch::Prot::Rw);
+    for id in [PING, PONG] {
+        PROC_DONE[id].store(false, Ordering::Release);
+        PROC_EXIT[id].store(0, Ordering::Relaxed);
     }
-    let stack_top = PING_STACK_VA + PAGE as u64;
-
-    // Bind ping's CSpace as the current process (the EL0 syscall handler resolves cptrs against it),
-    // then run it as a scheduler task that drops to EL0 at its entry.
-    *PROC_CS.lock() = Some(proc);
-    USER_DONE.store(false, Ordering::Release);
-    EXIT_CODE.store(0, Ordering::Relaxed);
-    scheduler::spawn(
-        // SAFETY: `loaded.entry` is loader-mapped EL0-executable code and `stack_top` the top of an
+    scheduler::spawn_proc(
+        // SAFETY: `ping_entry` is loader-mapped EL0-executable code; `ping_sp` the top of ping's
         // EL0-writable stack page.
-        move || unsafe { arch::enter_user(loaded.entry, stack_top) },
-        cap_core::Budget::new(u32::MAX, u32::MAX),
+        move || unsafe { arch::enter_user(ping_entry, ping_sp) },
+        Budget::new(u32::MAX, u32::MAX),
+        PING,
     );
-    while !USER_DONE.load(Ordering::Acquire) {
+    scheduler::spawn_proc(
+        // SAFETY: as above, for pong.
+        move || unsafe { arch::enter_user(pong_entry, pong_sp) },
+        Budget::new(u32::MAX, u32::MAX),
+        PONG,
+    );
+
+    // Drive both from the boot task until each leaves EL0.
+    while !(PROC_DONE[PING].load(Ordering::Acquire) && PROC_DONE[PONG].load(Ordering::Acquire)) {
         scheduler::yield_now();
     }
-    if EXIT_CODE.load(Ordering::Relaxed) != 0 {
-        fatal("refproc ping did not exit cleanly");
+    if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 || PROC_EXIT[PONG].load(Ordering::Relaxed) != 0 {
+        fatal("a refproc process did not exit cleanly");
     }
-    kprintln!("[praesidium] PRAESIDIUM-P7B-I1-OK");
+    kprintln!("[praesidium] PRAESIDIUM-P7B-I2-OK");
 }

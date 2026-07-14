@@ -15,7 +15,9 @@ PHDRS {
 }
 
 SECTIONS {
-    . = 0x40100000;
+    /* Link base — a distinct address per process so two processes coexist in the shared address
+     * space (P7b). xtask sets it per binary via `--defsym __base=0x...`; defaults to ping's base. */
+    . = DEFINED(__base) ? __base : 0x40100000;
 
     .text : ALIGN(0x1000) { *(.text .text.*) } :text
     .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) } :text

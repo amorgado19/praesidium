@@ -82,9 +82,9 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     // P7a: EL0 userspace transport — drop to EL0, run native code, service its syscall trap.
     user::run();
 
-    // P7b (i.1): run the REAL refproc ping.pex (a compiled userspace binary) — the .pex toolchain
-    // end-to-end (compile -> mkpex -> load -> run at EL0), replacing the P7a in-kernel blob.
-    user::run_pex();
+    // P7b (i.2): run the REAL refproc ping + pong .pex binaries CONCURRENTLY — two userspace
+    // processes, each resolving its own capabilities via the per-Task CSpace binding.
+    user::run_processes();
 
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();

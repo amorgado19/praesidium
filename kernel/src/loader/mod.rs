@@ -31,8 +31,11 @@ pub const PROCESS_SLOTS: usize = 16;
 const L_UNTYPED: Cptr = 0;
 const L_SCHED: Cptr = 1;
 const L_ENDPOINT: Cptr = 2;
-/// Scratch slots (retyped segment frames + split Sched children) start here.
-const L_SCRATCH: Cptr = 8;
+/// Scratch slots (retyped segment frames + split Sched children) start here. `pub` so a caller
+/// loading MULTIPLE processes from one authority can seed a shared `&mut scratch` cursor that
+/// advances across loads (the retyped segment-frame caps stay in the authority, so each load must
+/// use fresh slots — resetting to a fixed base would collide, P7b).
+pub const L_SCRATCH: Cptr = 8;
 
 /// The reserved virtual-address window a loaded process's segments must fall within
 /// (`[1 GiB, 2 GiB)`). A process vaddr is attacker-controlled hostile input; confining it here is
@@ -108,9 +111,9 @@ pub fn load(
     proc: &mut CSpace<PROCESS_SLOTS>,
     domain_id: u64,
     user_accessible: bool,
+    scratch: &mut Cptr,
 ) -> Result<Loaded, LoadError> {
     let pex = Pex::parse(image, arch::PEX_ARCH)?;
-    let mut scratch = L_SCRATCH;
 
     // --- Segments: retype owned frames, copy the file bytes, cache-maintain code, map W^X. ---
     let mut seg_frames: [Option<Cptr>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
@@ -133,8 +136,8 @@ pub fn load(
             .map_err(|_| LoadError::Pex(PexError::SegmentTooLarge))?;
         let mapped_bytes = (pages as usize) << 12;
 
-        let frame_slot = scratch;
-        scratch += 1;
+        let frame_slot = *scratch;
+        *scratch += 1;
         // One Frame object of `pages` contiguous frames, carved + zeroed from the loader's Untyped
         // (CAP-MEM-2 zero-on-retype gives a clean .bss tail for free).
         loader.retype(L_UNTYPED, CapType::Frame, pages, 1, frame_slot)?;
@@ -199,8 +202,8 @@ pub fn load(
             MANIFEST_SCHED => {
                 // SPLIT the loader's Sched (debits the loader — monotonic), then MOVE the child
                 // into the process. Sched is non-duplicable: it transfers, never forks.
-                let child = scratch;
-                scratch += 1;
+                let child = *scratch;
+                *scratch += 1;
                 loader.split(L_SCHED, child, m.param0 as u32)?;
                 grant(loader, child, proc, dest, rights, 0, GrantMode::Move)?;
                 budget = m.param0 as u32;
