@@ -22,15 +22,19 @@ pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user, set_ker
 /// The `.pex` architecture tag for this backend (ADR-0006) — see the x86-64 backend.
 pub const PEX_ARCH: u16 = abi::pex::ARCH_AARCH64;
 pub use paging::{
-    activate_address_space, build_address_space, enable_wx, install_guard_page, map_page,
-    map_user_page, page_prot, set_domain, sync_instruction_cache, translate,
+    activate_address_space, build_address_space, enable_wx, install_guard_page, kernel_space,
+    map_page, map_user_page, new_process_space, page_prot, set_domain, sync_instruction_cache,
+    translate,
 };
 
-/// The active process-vs-process isolation mechanism (P7b-ii, ISO-AC4 honesty). aarch64's primary
-/// is real FEAT_MTE (the per-domain-page-table fallback is the documented exception if it fails).
+/// The active process-vs-process **hostile-isolation** mechanism (P7b-ii, ISO-AC4 honesty). The red
+/// team proved MTE is userspace-defeatable (a process controls its own pointer tags — it can forge a
+/// victim's 4-bit tag), so the boundary that actually contains a hostile process is the per-domain
+/// page table (`TTBR0`): the victim's pages are not mapped in the attacker's table, so the access
+/// permission-faults regardless of the forged tag. MTE stays armed as the cooperative/defence layer.
 #[must_use]
 pub fn isolation_mechanism() -> &'static str {
-    "aarch64 FEAT_MTE tag-check (ADR-0008 DEC-0008-3)"
+    "aarch64 per-domain page tables (ADR-0008 DEC-0008-6); MTE = cooperative/defence-in-depth layer"
 }
 
 /// Arm the process-vs-process isolation mechanism before userspace runs (P7b-ii). On aarch64 this

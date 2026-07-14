@@ -129,11 +129,14 @@ global_asm!(
 .global praesidium_el0_fault_blob
 .global praesidium_el0_fault_blob_end
 praesidium_el0_fault_blob:
-    movz x0, #0x4012, lsl #16   // x0 = 0x4012_0000 (MUST equal crate::user::FAULT_PROBE_VA)
+    movz x0, #{probe_hi}, lsl #16   // x0 = FAULT_PROBE_VA (a supervisor page in the process's table)
     ldr  x1, [x0]               // EL0 read of a supervisor-only page -> data abort (permission)
     brk  #0                     // unreachable: the load traps; the kernel kills the process
 praesidium_el0_fault_blob_end:
-"#
+"#,
+    // FAULT_PROBE_VA is `hi << 16` (0x4012_0000); derive the movz immediate from the const so the
+    // blob's target stays in lock-step with the kernel's `FAULT_PROBE_VA`.
+    probe_hi = const (crate::user::FAULT_PROBE_VA >> 16),
 );
 
 /// The EL0 synchronous-exception handler. Called by `el0_sync_stub` with the saved integer frame

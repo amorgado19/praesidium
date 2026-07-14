@@ -10,9 +10,18 @@
 //! (DEC-0007-4).
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{AddressSpace, KernelMap, Prot};
 use crate::memory::{alloc_zeroed_frame, phys_to_virt};
+
+/// The pristine kernel base roots (`TTBR1` = HHDM + kernel high half; `TTBR0` = identity low half,
+/// **NO user process pages**), captured by [`build_address_space`]. Each userspace process runs on
+/// its OWN `TTBR0` — a clone of the base low half plus only its own pages ([`new_process_space`]) —
+/// while sharing the kernel high half, so a process cannot even NAME another's memory (P7b-ii
+/// hostile-isolation boundary, ADR-0008 DEC-0008-6). Kernel tasks run on the base.
+static KERNEL_TTBR0: AtomicU64 = AtomicU64::new(0);
+static KERNEL_TTBR1: AtomicU64 = AtomicU64::new(0);
 
 const PAGE: u64 = 4096;
 const GIB: u64 = 1 << 30;
@@ -130,9 +139,53 @@ pub fn build_address_space(km: &KernelMap) -> AddressSpace {
     let ttbr1 = alloc_table();
     map_low(ttbr1, lidx(km.hhdm_offset, 0), km.identity_bytes);
     map_kernel(ttbr1, km);
+    KERNEL_TTBR0.store(ttbr0, Ordering::Relaxed); // the pristine base every process TTBR0 clones
+    KERNEL_TTBR1.store(ttbr1, Ordering::Relaxed); // shared kernel high half
     AddressSpace {
         primary: ttbr1,
         secondary: ttbr0,
+    }
+}
+
+/// The pristine kernel base address space (kernel + identity + HHDM, no user pages) — what kernel
+/// tasks run on, and whose high half [`new_process_space`] shares. Valid after [`build_address_space`].
+#[must_use]
+pub fn kernel_space() -> AddressSpace {
+    AddressSpace {
+        primary: KERNEL_TTBR1.load(Ordering::Relaxed),
+        secondary: KERNEL_TTBR0.load(Ordering::Relaxed),
+    }
+}
+
+/// Build a fresh per-process page table (P7b-ii hostile isolation): the shared kernel high half
+/// (`TTBR1`) plus a PRIVATE low-half (`TTBR0`) whose process VA window `[1 GiB, 2 GiB)` (L0[0] →
+/// L1[1] → L2) is a clone the loader maps this process's pages into — invisible to every other
+/// table. A process forming a raw pointer to another's VA finds, in ITS table, the shared **EL1-only**
+/// identity 2 MiB block (never an EL0 page), so an EL0 access permission-faults — a boundary no
+/// userspace instruction can cross (unlike MTE tag-forge). Deep-copies exactly three tables; the
+/// loader then splits the identity blocks in the private L2 to place user pages.
+#[must_use]
+pub fn new_process_space() -> AddressSpace {
+    let kbase = KERNEL_TTBR0.load(Ordering::Relaxed);
+    let clone_table = |orig: u64| -> u64 {
+        let new = alloc_table();
+        for i in 0..512 {
+            write_entry(new, i, read_entry(orig, i));
+        }
+        new
+    };
+    // Clone L0; then a private L1 (L0[0]); then a private L2 for the process window (L1[1] =
+    // [1 GiB, 2 GiB), identity 2 MiB blocks since IDENTITY_BYTES = 4 GiB).
+    let new_l0 = clone_table(kbase);
+    let e0 = read_entry(kbase, 0); // L0[0] -> low L1 (always present: identity + window)
+    let new_l1 = clone_table(e0 & ADDR_MASK);
+    write_entry(new_l0, 0, new_l1 | (e0 & !ADDR_MASK));
+    let e1 = read_entry(e0 & ADDR_MASK, 1); // L1[1] -> L2 covering [1 GiB, 2 GiB)
+    let new_l2 = clone_table(e1 & ADDR_MASK);
+    write_entry(new_l1, 1, new_l2 | (e1 & !ADDR_MASK));
+    AddressSpace {
+        primary: KERNEL_TTBR1.load(Ordering::Relaxed),
+        secondary: new_l0,
     }
 }
 

@@ -8,9 +8,17 @@
 //! `mov cr3`; the only change is W^X on the kernel image.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{AddressSpace, KernelMap, Prot};
 use crate::memory::{alloc_zeroed_frame, phys_to_virt};
+
+/// The pristine kernel base PML4 (kernel image + identity + HHDM, **NO user process pages**),
+/// captured when [`build_address_space`] builds it. Each userspace process runs on its OWN page
+/// table — a clone of this base plus only its own pages ([`new_process_space`]) — so a process
+/// cannot even NAME another's memory: the victim's pages are simply not mapped in the attacker's
+/// table (P7b-ii hostile-isolation boundary, ADR-0008 DEC-0008-6). Kernel tasks run on this base.
+static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -110,8 +118,52 @@ pub fn build_address_space(km: &KernelMap) -> AddressSpace {
     map_low(pml4, 0, km.identity_bytes); // identity (low half)
     map_low(pml4, idx(km.hhdm_offset, 3), km.identity_bytes); // HHDM (higher half)
     map_kernel(pml4, km);
+    KERNEL_PML4.store(pml4, Ordering::Relaxed); // the pristine base every process table clones
     AddressSpace {
         primary: pml4,
+        secondary: 0,
+    }
+}
+
+/// The pristine kernel base address space (kernel + identity + HHDM, no user pages) — what kernel
+/// tasks run on, and what [`new_process_space`] clones. Valid after [`build_address_space`].
+#[must_use]
+pub fn kernel_space() -> AddressSpace {
+    AddressSpace {
+        primary: KERNEL_PML4.load(Ordering::Relaxed),
+        secondary: 0,
+    }
+}
+
+/// Build a fresh per-process page table (P7b-ii hostile isolation): a clone of the kernel base with a
+/// PRIVATE sub-tree for the process VA window `[1 GiB, 2 GiB)` (PML4[0] → PDPT[1] → PD), so this
+/// process's user pages — mapped into that PD by the loader — are invisible to every other table.
+/// Everything else (identity below 1 GiB, HHDM, kernel high half) is shared read-only. A process
+/// that forms a raw pointer to another process's VA finds, in ITS table, the shared **supervisor**
+/// identity 2 MiB huge page (never a user page), so an EL0/ring-3 access permission-faults — a
+/// boundary no userspace instruction can cross (unlike PKU's `WRPKRU` / MTE tag-forge). Deep-copies
+/// exactly three tables; the loader then splits the huge pages in the private PD to place user pages.
+#[must_use]
+pub fn new_process_space() -> AddressSpace {
+    let kbase = KERNEL_PML4.load(Ordering::Relaxed);
+    let clone_table = |orig: u64| -> u64 {
+        let new = alloc_table();
+        for i in 0..512 {
+            write_entry(new, i, read_entry(orig, i));
+        }
+        new
+    };
+    // PML4 clone; then a private low-half PDPT (PML4[0]); then a private PD for the process window
+    // (PDPT[1] = [1 GiB, 2 GiB), identity-mapped as 2 MiB huge pages since IDENTITY_BYTES = 4 GiB).
+    let new_pml4 = clone_table(kbase);
+    let e0 = read_entry(kbase, 0); // PML4[0] -> low-half PDPT (always present: identity + window)
+    let new_pdpt = clone_table(e0 & ADDR_MASK);
+    write_entry(new_pml4, 0, new_pdpt | (e0 & !ADDR_MASK));
+    let e1 = read_entry(e0 & ADDR_MASK, 1); // PDPT[1] -> PD covering [1 GiB, 2 GiB)
+    let new_pd = clone_table(e1 & ADDR_MASK);
+    write_entry(new_pdpt, 1, new_pd | (e1 & !ADDR_MASK));
+    AddressSpace {
+        primary: new_pml4,
         secondary: 0,
     }
 }

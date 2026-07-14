@@ -15,9 +15,11 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use cap_core::Budget;
 
-use crate::arch::{self, Context};
+use crate::arch::{self, AddressSpace, Context};
 use crate::memory;
 use crate::sync::SpinLock;
 
@@ -61,10 +63,15 @@ struct Task {
     /// bring-up CSpace. `None` for kernel tasks (the idle/boot task, the hog, the executor).
     proc_id: Option<usize>,
     /// The task's isolation domain (P7b-ii): the process's PKU protection key (x86) / MTE tag
-    /// (aarch64). The scheduler programs it via [`arch::set_domain`] on switch-in, so a process
-    /// resumes with ONLY its own domain accessible — a raw read of a peer's page faults. `None` for
-    /// kernel tasks (all domains accessible; the kernel touches no foreign-keyed user page).
+    /// (aarch64) — the cooperative-compartment / defence-in-depth layer. The scheduler programs it
+    /// via [`arch::set_domain`] on switch-in. `None` for kernel tasks.
     domain: Option<u64>,
+    /// The task's address space (P7b-ii hostile-isolation boundary): a userspace process runs on its
+    /// OWN page table, which maps only ITS pages + the shared kernel — so it cannot even name another
+    /// process's memory. The scheduler swaps to it on switch-in ([`arch::activate_address_space`]).
+    /// Kernel tasks use the shared [`arch::kernel_space`]. This swap is the real cross-process
+    /// boundary (PKU/MTE are userspace-defeatable; a page table is not).
+    space: AddressSpace,
 }
 
 struct Scheduler {
@@ -110,6 +117,28 @@ impl Scheduler {
 /// The scheduler, `None` until [`bootstrap`]. Every access masks preemption first.
 static SCHED: SpinLock<Option<Scheduler>> = SpinLock::new(None);
 
+/// The address-space roots currently loaded (to skip a redundant page-table swap + TLB flush when
+/// switching between tasks that share a space — every kernel task, the SASOS cooperative fast path).
+/// Initialised lazily on the first switch. Only touched under preemption-masking (single CPU).
+static ACTIVE_PRIMARY: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SECONDARY: AtomicU64 = AtomicU64::new(0);
+
+/// Swap to `space`'s page table iff it differs from the currently-loaded one. Called on switch-in
+/// (preemption-masked). Kernel↔kernel switches share [`arch::kernel_space`], so they skip the swap
+/// (zero-swap for cooperative/kernel tasks); a switch to/from an isolated userspace process swaps
+/// (hostile isolation costs a page-table reload + TLB flush, like any OS).
+fn activate_space(space: AddressSpace) {
+    if space.primary != ACTIVE_PRIMARY.load(Ordering::Relaxed)
+        || space.secondary != ACTIVE_SECONDARY.load(Ordering::Relaxed)
+    {
+        // SAFETY: every process/kernel space shares the kernel high half + HHDM + identity, so the
+        // current PC, stack, and kernel data stay mapped across the switch; called preemption-masked.
+        unsafe { arch::activate_address_space(space) };
+        ACTIVE_PRIMARY.store(space.primary, Ordering::Relaxed);
+        ACTIVE_SECONDARY.store(space.secondary, Ordering::Relaxed);
+    }
+}
+
 /// Install the bootstrap ("idle") task — the currently-running boot context becomes task 0, so
 /// the first [`schedule`] saves its real register state. Call once, before spawning.
 pub fn bootstrap() {
@@ -121,6 +150,7 @@ pub fn bootstrap() {
         body: None,
         proc_id: None,
         domain: None,
+        space: arch::kernel_space(),
     });
     let mut g = SCHED.lock();
     *g = Some(Scheduler {
@@ -129,17 +159,25 @@ pub fn bootstrap() {
     });
 }
 
-/// Spawn a runnable kernel task with `body` and CPU-time `budget` (no bound userspace process).
+/// Spawn a runnable kernel task with `body` and CPU-time `budget` (no bound userspace process; runs
+/// on the shared kernel address space).
 pub fn spawn(body: impl FnOnce() + Send + 'static, budget: Budget) {
-    spawn_inner(body, budget, None, None);
+    spawn_inner(body, budget, None, None, arch::kernel_space());
 }
 
-/// Spawn a runnable task bound to userspace process `proc_id` in isolation `domain` (P7b): the
-/// EL0/ring-3 syscall handler resolves this task's invoked cptrs against that process's CSpace (see
-/// [`current_proc_id`]), and the scheduler programs `domain` (its PKU key / MTE tag) on switch-in
-/// so the process resumes with only its own memory reachable ([`arch::set_domain`]).
-pub fn spawn_proc(body: impl FnOnce() + Send + 'static, budget: Budget, proc_id: usize, domain: u64) {
-    spawn_inner(body, budget, Some(proc_id), Some(domain));
+/// Spawn a runnable task bound to userspace process `proc_id` in isolation `domain`, running on its
+/// OWN address `space` (P7b): the EL0/ring-3 syscall handler resolves this task's invoked cptrs
+/// against that process's CSpace (see [`current_proc_id`]); the scheduler swaps to `space` (the
+/// hostile-isolation boundary — the process's table maps only its own pages) and programs `domain`
+/// (PKU key / MTE tag, defence-in-depth) on switch-in.
+pub fn spawn_proc(
+    body: impl FnOnce() + Send + 'static,
+    budget: Budget,
+    proc_id: usize,
+    domain: u64,
+    space: AddressSpace,
+) {
+    spawn_inner(body, budget, Some(proc_id), Some(domain), space);
 }
 
 /// Allocate a guarded kernel stack, prime the initial context, and enqueue a new runnable task.
@@ -148,6 +186,7 @@ fn spawn_inner(
     budget: Budget,
     proc_id: Option<usize>,
     domain: Option<u64>,
+    space: AddressSpace,
 ) {
     // Allocate the whole guarded block; the usable stack occupies its top `STACK_BYTES`, with a
     // guard frame directly below the stack's lowest byte.
@@ -174,6 +213,7 @@ fn spawn_inner(
         body: Some(Box::new(body)),
         proc_id,
         domain,
+        space,
     });
     with_sched(|s| s.tasks.push(task));
 }
@@ -204,19 +244,23 @@ fn schedule() {
                 s.current = next;
                 let ksp = kernel_stack_top(s, next);
                 let domain = s.tasks[next].domain;
-                Some((s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, ksp, domain))
+                let space = s.tasks[next].space;
+                Some((s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, ksp, domain, space))
             }
             _ => None,
         }
     });
-    if let Some((from_ptr, to_ptr, ksp, domain)) = switch {
+    if let Some((from_ptr, to_ptr, ksp, domain, space)) = switch {
+        // Swap to the incoming task's page table (the hostile-isolation boundary) BEFORE it runs;
+        // shared for kernel↔kernel switches, so those skip the swap (SASOS cooperative fast path).
+        activate_space(space);
         // x86 `syscall` shares one kernel-RSP global, so point it (+ TSS.RSP0) at the incoming
         // task's kernel stack BEFORE it runs — no-op on aarch64 (per-task-banked SP_EL1).
         if let Some(top) = ksp {
             arch::set_kernel_stack(top);
         }
-        // Program the incoming task's isolation domain (PKU key / MTE tag) so a userspace process
-        // resumes with ONLY its own pages reachable; a kernel task (`None`) gets all keys (P7b-ii).
+        // Program the incoming task's isolation domain (PKU key / MTE tag — defence-in-depth /
+        // cooperative-compartment layer); a kernel task (`None`) gets all keys (P7b-ii).
         arch::set_domain(domain);
         // SAFETY: both pointers address stable boxed `Task` contexts that outlive the switch;
         // preemption is masked (single-CPU exclusion) so no concurrent code mutates them, and
@@ -270,13 +314,15 @@ fn task_exit() -> ! {
                 s.current = next;
                 let ksp = kernel_stack_top(s, next);
                 let domain = s.tasks[next].domain;
-                (s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, ksp, domain)
+                let space = s.tasks[next].space;
+                (s.ctx_ptr(from), s.ctx_ptr(next) as *const Context, ksp, domain, space)
             })
         });
         match switch {
             // SAFETY: as in `schedule`; this finished task is never resumed, so the outgoing
             // context save is discarded — that is fine, its stack is abandoned.
-            Some((from_ptr, to_ptr, ksp, domain)) => {
+            Some((from_ptr, to_ptr, ksp, domain, space)) => {
+                activate_space(space);
                 if let Some(top) = ksp {
                     arch::set_kernel_stack(top);
                 }

@@ -16,20 +16,20 @@ pub use context::{context_init, context_switch, Context};
 pub use interrupts::{contains_raw_read, interrupts_init};
 pub use paging::{
     activate_address_space, build_address_space, build_domain_excluding, enable_wx,
-    install_guard_page, map_page, map_user_page, page_prot, sync_instruction_cache, translate,
+    install_guard_page, kernel_space, map_page, map_user_page, new_process_space, page_prot,
+    sync_instruction_cache, translate,
 };
 pub use pku::set_domain;
 pub use timer::timer_init;
 
-/// The active process-vs-process isolation mechanism (P7b-ii, ISO-AC4 honesty): the PKU primary
-/// when hardware protection keys are present + enabled, otherwise the per-domain-page-table fallback.
+/// The active process-vs-process **hostile-isolation** mechanism (P7b-ii, ISO-AC4 honesty). The red
+/// team proved PKU is userspace-defeatable (`WRPKRU` is unprivileged), so the boundary that actually
+/// contains a hostile process is the per-domain page table (its pages are simply not mapped in the
+/// attacker's table — no userspace instruction crosses it). PKU stays armed as the cooperative-
+/// compartment / defence-in-depth layer ([`pku`]).
 #[must_use]
 pub fn isolation_mechanism() -> &'static str {
-    if pku::available() {
-        "x86 PKU protection keys (ADR-0008 DEC-0008-2)"
-    } else {
-        "x86 per-domain page tables (fallback, ADR-0008 DEC-0008-6)"
-    }
+    "x86 per-domain page tables (ADR-0008 DEC-0008-6); PKU = cooperative/defence-in-depth layer"
 }
 
 /// Arm the process-vs-process isolation mechanism before userspace runs (P7b-ii). On x86 PKU is

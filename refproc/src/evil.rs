@@ -1,30 +1,56 @@
 //! refproc `evil` (P7b-ii) — the HOSTILE reference process for the AC7.3 isolation red-team. Unlike
 //! `ping`/`pong` (well-behaved Rust components), `evil` is a real NATIVE binary that deliberately
-//! attempts to read another process's memory with a RAW POINTER — holding no capability to it, only
-//! a hardcoded virtual address. In a naive single-address-space OS this succeeds (one page table,
-//! every mapped byte reachable); Praesidium's CAP-MEM-3 backstop (x86 PKU / aarch64 MTE) must make
-//! it FAULT, so the kernel contains the breach by killing `evil` while the victim + kernel survive.
-//! This is the existential proof the whole SASOS thesis rests on — distinct from P5b's *armed*
-//! in-kernel proof: here the adversary is a hostile native binary, exactly as the threat model says.
+//! attempts to read another process's memory. The threat model (ADR-0008 R1) is a hostile native
+//! binary, so `evil` does NOT play nice: it actively tries to DEFEAT the hardware domain before the
+//! read — x86: rewrite PKRU via the UNPRIVILEGED `WRPKRU` to unlock all protection keys; aarch64:
+//! forge the victim's MTE tag into the pointer (the tag is 4 bits the process itself controls). A
+//! sound isolation backstop must contain the read anyway (a mechanism the process cannot defeat); if
+//! the read RETURNS, isolation FAILED and `evil` reports the breach loudly.
 #![no_std]
 #![no_main]
 
-/// The victim virtual address `evil` raw-reads: `pong`'s segment base (the loader maps `pong` here,
-/// in `pong`'s distinct isolation domain). Must equal xtask's `--defsym __base` for `pong`
-/// (`0x40300000`). `evil` links at a different base, so this is unambiguously *another* domain.
+/// The victim virtual address `evil` raw-reads: `pong`'s segment base. Must equal xtask's
+/// `--defsym __base` for `pong` (`0x40300000`).
 const VICTIM_VA: usize = 0x4030_0000;
+/// `pong`'s isolation domain (the loader assigns ping=1, pong=2, evil=3 — a predictable assignment
+/// an attacker knows or brute-forces over 4 bits). Used to forge pong's MTE tag on aarch64.
+#[cfg(target_arch = "aarch64")]
+const VICTIM_DOMAIN: u64 = 2;
 
-/// Process entry — dropped to at EL0/ring-3 with GPRs zeroed. `evil` forms a raw pointer to the
-/// victim's page (no capability, no grant) and reads it. The hardware isolation backstop must trap
-/// the read; the kernel then kills `evil`. If the read RETURNS, isolation has FAILED — `evil`
-/// reports the stolen word loudly and exits with a breach code so the smoke fails attributably.
+/// Process entry — dropped to at EL0/ring-3 with GPRs zeroed. `evil` attempts to defeat the hardware
+/// isolation domain, then reads the victim's page. The backstop must trap the read regardless; the
+/// kernel then kills `evil`. If the read RETURNS, isolation has FAILED — report the stolen word.
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // SAFETY: this is DELIBERATELY an isolation violation — the entire purpose of the red-team. The
-    // read MUST be contained by PKU (x86) / MTE (aarch64); reaching the next line means it was not.
-    let stolen = unsafe { core::ptr::read_volatile(VICTIM_VA as *const u64) };
-    // Only reached on a BREACH (the raw cross-domain read was not contained). Report the stolen word
-    // so the failure is loud + attributable, then exit with a distinctive breach code.
+    // Active bypass: unlock all PKU protection keys. WRPKRU is UNPRIVILEGED — usable from ring 3 —
+    // so a hostile process can clear its own PKRU and defeat protection-key isolation entirely.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: WRPKRU writes PKRU from EAX with ECX=EDX=0; EAX=0 clears every access/write-disable
+    // bit, unlocking all 16 keys. Deliberately defeats PKU — the point of the red-team.
+    unsafe {
+        core::arch::asm!(
+            "mov ecx, 0",
+            "mov edx, 0",
+            "mov eax, 0",
+            "wrpkru",
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+
+    // The pointer to the victim. aarch64: forge the victim's MTE tag into the top byte (the process
+    // controls pointer tags) so a tag check would MATCH. x86: a plain pointer (PKRU already cleared).
+    #[cfg(target_arch = "aarch64")]
+    let victim = (VICTIM_VA as u64 | (VICTIM_DOMAIN << 56)) as *const u64;
+    #[cfg(target_arch = "x86_64")]
+    let victim = VICTIM_VA as *const u64;
+
+    // SAFETY: the deliberate cross-domain read after actively defeating the hardware domain. A sound
+    // backstop (one the process cannot defeat) must trap this; reaching the next line is a breach.
+    let stolen = unsafe { core::ptr::read_volatile(victim) };
+    // Only reached on a BREACH. Report the stolen word loudly, then exit with a distinctive code.
     refproc::debug(stolen);
-    refproc::exit(0xB4EAC4) // "breach" — a non-killed exit; the kernel asserts evil was KILLED instead
+    refproc::exit(0xB4EAC4) // "breach" — a non-killed exit; the kernel asserts evil was KILLED
 }

@@ -320,23 +320,33 @@ fn run_el0_process(blob: &[u8], id: usize, domain: u64, code_phys: u64, code_va:
         core::ptr::copy_nonoverlapping(blob.as_ptr(), code_hhdm as *mut u8, blob.len());
     }
     arch::sync_instruction_cache(code_hhdm, blob.len());
-    // SAFETY: map owned frames EL0-accessible at the process VAs — R-X code, RW stack (W^X) — in the
-    // process's isolation `domain` (PKU key / MTE tag).
+    // Give the process its OWN page table (the hostile-isolation boundary) and map its pages into
+    // it: activate it while mapping (preemption-masked so the scheduler's active-space tracking stays
+    // consistent — the copy above went through the table-independent HHDM), then restore the kernel
+    // space for the boot task. The scheduler swaps to `space` when this process is scheduled.
+    let space = arch::new_process_space();
+    let prev = arch::preempt_disable();
+    // SAFETY: `space` shares the kernel mappings, so the boot task keeps running across the switch;
+    // map the frames EL0-accessible R-X code / RW stack (W^X) in the process's `domain`, then restore.
     unsafe {
+        arch::activate_address_space(space);
         arch::map_user_page(code_va, code_phys, arch::Prot::Rx, domain);
         arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw, domain);
+        arch::activate_address_space(arch::kernel_space());
     }
+    arch::preempt_restore(prev);
     let stack_top = stack_va + PAGE as u64;
 
     PROC_DONE[id].store(false, Ordering::Release);
     PROC_EXIT[id].store(0, Ordering::Relaxed);
     scheduler::spawn_proc(
         // SAFETY: `code_va` maps EL0-executable code (entry at offset 0) and `stack_top` the top of
-        // an EL0-writable stack page.
+        // an EL0-writable stack page, both in `space`.
         move || unsafe { arch::enter_user(code_va, stack_top, domain) },
         Budget::new(u32::MAX, u32::MAX),
         id,
         domain,
+        space,
     );
     while !PROC_DONE[id].load(Ordering::Acquire) {
         scheduler::yield_now();
@@ -365,14 +375,11 @@ pub fn run() {
         fatal("bring-up process did not exit cleanly");
     }
 
-    // (2) Isolation taste: a supervisor-only page raw-read from EL0 faults; the kernel kills the
-    // process and keeps running.
-    let probe_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for the fault probe"));
-    // SAFETY: map a supervisor-only (no EL0 access) read-only page at `FAULT_PROBE_VA`; an EL0 read
-    // of it is a permission fault, exercising the kill-process path.
-    unsafe {
-        arch::map_page(FAULT_PROBE_VA, probe_phys, arch::Prot::Ro);
-    }
+    // (2) Isolation taste: an EL0 raw-read of a supervisor page faults; the kernel kills the process
+    // and keeps running. In the fault blob's OWN page table, `FAULT_PROBE_VA` is the un-shadowed
+    // supervisor identity mapping (no EL0 page there — the blob maps only its code+stack), so the
+    // read is a permission fault (P7b-ii: no separate probe frame needed — the per-process table
+    // already denies EL0 every VA it did not map).
     run_el0_process(arch::el0_fault_blob(), PING, P7A_DOMAIN, code_phys, USER_CODE_VA, stack_phys, USER_STACK_VA);
     if PROC_EXIT[PING].load(Ordering::Relaxed) != u64::MAX {
         fatal("fault process was not killed by the EL0 fault path");
@@ -397,25 +404,38 @@ fn load_process(
     id: usize,
     stack_va: u64,
     name: &str,
-) -> (u64, u64) {
+) -> (u64, u64, arch::AddressSpace) {
+    // Each process runs on its OWN page table (the hostile-isolation boundary): build it, then map
+    // this process's segments + stack into it. Activate it while mapping (preemption-masked so the
+    // scheduler's active-space tracking stays consistent), then restore the kernel space for the
+    // boot task; the scheduler swaps to `space` when the process is scheduled.
+    let space = arch::new_process_space();
     let mut cs = CSpace::<PROC_SLOTS>::new(crate::loader::zero_frames);
+    let prev = arch::preempt_disable();
+    // SAFETY: `space` shares the kernel mappings (HHDM, kernel, identity) the loader + kernel use, so
+    // execution continues across the switch; the loader maps the process's segments into it.
+    unsafe {
+        arch::activate_address_space(space);
+    }
     let loaded = crate::loader::load(pex, loader, &mut cs, domain, true, scratch)
         .unwrap_or_else(|e| fatal_load("refproc .pex failed to load", e));
+    let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for refproc stack"));
+    // SAFETY: map an owned frame RW + EL0-accessible at the process's stack VA into `space` (in the
+    // reserved window, disjoint from the segments), tagged with `domain` (defence-in-depth); then
+    // restore the kernel space for the boot task.
+    unsafe {
+        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw, domain);
+        arch::activate_address_space(arch::kernel_space());
+    }
+    arch::preempt_restore(prev);
     kprintln!(
         "[praesidium] user: {name}.pex loaded — entry {:#x}, budget {}, {} manifest caps (AC6.4)",
         loaded.entry,
         loaded.budget,
         crate::loader::occupied_slots(&cs)
     );
-    let stack_phys = memory::alloc_frames(0).unwrap_or_else(|| fatal("no frame for refproc stack"));
-    // SAFETY: map an owned frame RW + EL0-accessible at the process's stack VA (in the reserved
-    // window, disjoint from the segments + the other process's pages), tagged with the process's
-    // isolation `domain` (PKU key / MTE tag) — so a peer's raw read of this stack faults.
-    unsafe {
-        arch::map_user_page(stack_va, stack_phys, arch::Prot::Rw, domain);
-    }
     PROC_CSPACES.lock()[id] = Some(cs);
-    (loaded.entry, stack_va + PAGE as u64)
+    (loaded.entry, stack_va + PAGE as u64, space)
 }
 
 /// P7b (i.2/i.3): load the real `refproc` ping + pong `.pex` binaries and run them CONCURRENTLY at
@@ -439,9 +459,9 @@ pub fn run_processes() {
     // authority, so a reset base would collide (LOADER_SLOTS=32 holds both processes' scratch).
     let mut loader = crate::loader::authority();
     let mut scratch = crate::loader::L_SCRATCH;
-    let (ping_entry, ping_sp) =
+    let (ping_entry, ping_sp, ping_space) =
         load_process(&mut loader, &mut scratch, PING_PEX, DOMAIN_PING, PING, PING_STACK_VA, "ping");
-    let (pong_entry, pong_sp) =
+    let (pong_entry, pong_sp, pong_space) =
         load_process(&mut loader, &mut scratch, PONG_PEX, DOMAIN_PONG, PONG, PONG_STACK_VA, "pong");
 
     kprintln!(
@@ -460,6 +480,7 @@ pub fn run_processes() {
         Budget::new(u32::MAX, u32::MAX),
         PING,
         DOMAIN_PING,
+        ping_space,
     );
     scheduler::spawn_proc(
         // SAFETY: as above, for pong.
@@ -467,6 +488,7 @@ pub fn run_processes() {
         Budget::new(u32::MAX, u32::MAX),
         PONG,
         DOMAIN_PONG,
+        pong_space,
     );
 
     // Drive both from the boot task until each leaves EL0.
@@ -496,18 +518,19 @@ fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr) {
         "[praesidium] user: P7b-ii AC7.3 red-team — loading HOSTILE evil.pex (it raw-reads pong's memory at {:#x})",
         PONG_STACK_VA - 0x10_0000 // pong's segment base 0x4030_0000 (see evil::VICTIM_VA)
     );
-    let (evil_entry, evil_sp) =
+    let (evil_entry, evil_sp, evil_space) =
         load_process(loader, scratch, EVIL_PEX, DOMAIN_EVIL, EVIL, EVIL_STACK_VA, "evil");
 
     PROC_DONE[EVIL].store(false, Ordering::Release);
     PROC_EXIT[EVIL].store(0, Ordering::Relaxed);
     scheduler::spawn_proc(
         // SAFETY: `evil_entry` is loader-mapped EL0-executable code; `evil_sp` the top of evil's
-        // EL0-writable stack page.
+        // EL0-writable stack page, both in evil's OWN table (which does NOT map ping/pong's pages).
         move || unsafe { arch::enter_user(evil_entry, evil_sp, DOMAIN_EVIL) },
         Budget::new(u32::MAX, u32::MAX),
         EVIL,
         DOMAIN_EVIL,
+        evil_space,
     );
     while !PROC_DONE[EVIL].load(Ordering::Acquire) {
         scheduler::yield_now();
