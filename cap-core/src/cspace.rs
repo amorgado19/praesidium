@@ -143,6 +143,27 @@ impl<const N: usize> CSpace<N> {
         };
     }
 
+    /// Install a `Notification` capability at `slot` naming async-signal object `notif_id`, with
+    /// `rights` (SIGNAL to raise, WAIT to block-until-raised — SPEC-CAP §2). The kernel-managed grant
+    /// path for a Notification (like an Endpoint, a Notification is duplicable/grantable per its
+    /// rights — many holders may WAIT or SIGNAL; it is NOT a per-cap-state type). Used by the bridge
+    /// substrate so a userspace waiter holds a WAIT cap the kernel (a future IRQ source) SIGNALs.
+    pub fn install_notification(&mut self, slot: Cptr, notif_id: u64, rights: Rights) {
+        debug_assert!(slot < N, "install_notification: slot out of bounds");
+        self.slots[slot] = Cte {
+            cap: RawCap {
+                cap_type: CapType::Notification,
+                rights,
+                objref: notif_id,
+                size: 0,
+                watermark: 0,
+                aux: 0,
+                badge: 0,
+            },
+            parent: NIL,
+        };
+    }
+
     /// Install a `SharedRo` capability at `slot` (v1.1, ADR-0004): a **read-only shared window**
     /// naming `frames` frame(s) from base frame number `base_pfn`, which the kernel has co-mapped
     /// read-only into this holder's address space at virtual address `va`. Carries **only** `READ`

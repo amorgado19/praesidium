@@ -69,6 +69,20 @@ static EP_RDV: SpinLock<Rdv> = SpinLock::new(Rdv {
     reply: None,
 });
 
+/// The async-signal state for the bridge-substrate `Notification` (substrate.2). A single global
+/// notification (like [`EP_RDV`], a real per-Notification registry keyed by objref generalises it):
+/// a waiter `NOTIFY_WAIT`s (registers, then spin-yields until `signaled`), the kernel or a
+/// `NOTIFY_SIGNAL` sets `signaled` (waking it). `signaled` is a pending-signal latch (consumed on
+/// wait), so a signal that arrives before the wait is not lost — the wake IS the message (no payload).
+struct Notify {
+    signaled: bool,
+    waiter: Option<usize>,
+}
+static NOTIFY: SpinLock<Notify> = SpinLock::new(Notify {
+    signaled: false,
+    waiter: None,
+});
+
 // ---- P7a in-kernel bring-up blob VAs (the transport + fault-kill regression) ----
 const USER_CODE_VA: u64 = 0x4010_0000;
 const USER_STACK_VA: u64 = 0x4011_0000;
@@ -95,6 +109,13 @@ const EVIL_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_EVIL_PEX"));
 /// Bridge substrate: the persistent echo SERVER + its client (a RECV-serve loop serving many requests).
 const ECHOD_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_ECHOD_PEX"));
 const ECHOCLI_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_ECHOCLI_PEX"));
+/// Bridge substrate.2: a process that WAITs on a Notification (the P9 IRQ→driver-wake path).
+const WAITER_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_WAITER_PEX"));
+/// The CSpace slot the kernel installs the waiter's `Notification` cap at (matches `refproc::NOTIF`);
+/// past the manifest (1=Sched, 2=Endpoint), Reply (3), and SharedRo (4) slots.
+const NOTIF_SLOT: Cptr = 5;
+/// The substrate Notification's object id (informational; one global notification for the demo).
+const NOTIF_ID: u64 = 0x0090_7117;
 /// User-stack VAs (one page each), distinct from the processes' segments (ping @ 0x4010_0000, pong
 /// @ 0x4030_0000, evil @ 0x4050_0000) and each other — all inside the reserved window [1 GiB, 2 GiB).
 const PING_STACK_VA: u64 = 0x4020_0000;
@@ -170,6 +191,10 @@ pub fn syscall(inv: &Invocation) -> u64 {
         op::ENDPOINT_CALL => ipc_call(id, inv),
         op::ENDPOINT_RECV => ipc_recv(id, inv),
         op::ENDPOINT_REPLY => ipc_reply(id, inv),
+        // Async signal (bridge substrate): WAIT blocks until the Notification is raised (by the
+        // kernel — modelling a P9 IRQ — or a NOTIFY_SIGNAL); SIGNAL raises it. Rights-checked (RI).
+        op::NOTIFY_WAIT => notify_wait(id, inv),
+        op::NOTIFY_SIGNAL => notify_signal_op(id, inv),
         // DEBUG_EMIT / PROC_EXIT / the P6 ops — resolve + rights-check via the P6 dispatch, then
         // apply the effect (a divergent exit cannot be expressed through the value-returning
         // dispatch). Release the CSpace lock BEFORE any divergence (`exit_current` never returns).
@@ -288,6 +313,48 @@ fn ipc_reply(id: usize, inv: &Invocation) -> u64 {
     }
     EP_RDV.lock().reply = Some(inv.args[0]);
     0
+}
+
+/// `NOTIFY_WAIT` (bridge substrate.2): rights-check WAIT on the Notification (RI, via the P6
+/// dispatch — kills the process if the cap is missing/wrong), register as the waiter, then BLOCK
+/// (spin-yield) until the notification is raised (by the kernel — a P9-IRQ stand-in — or a
+/// `NOTIFY_SIGNAL`). Consumes the pending signal on wake and returns 0 (no payload; the wake IS the
+/// message). The lock is dropped before each yield (no lock across a context switch).
+fn notify_wait(id: usize, inv: &Invocation) -> u64 {
+    ipc_check(id, inv); // WAIT-right check via the P6 dispatch; kills the process if unauthorized
+    NOTIFY.lock().waiter = Some(id); // register so the kernel/IRQ knows a waiter is blocked
+    loop {
+        {
+            let mut n = NOTIFY.lock();
+            if n.signaled {
+                n.signaled = false; // consume the pending signal
+                n.waiter = None;
+                return 0; // woke
+            }
+        }
+        scheduler::yield_now();
+    }
+}
+
+/// `NOTIFY_SIGNAL` (bridge substrate.2): rights-check SIGNAL on the Notification (RI), then raise it,
+/// waking a blocked waiter (or latching the signal for the next wait). Fire-and-forget.
+fn notify_signal_op(id: usize, inv: &Invocation) -> u64 {
+    ipc_check(id, inv); // SIGNAL-right check; kills the process if unauthorized
+    NOTIFY.lock().signaled = true;
+    0
+}
+
+/// Raise the substrate Notification from the KERNEL — the stand-in for the P9 in-kernel IRQ core
+/// signalling a userspace driver (which will call this from the raw-IRQ handler). Wakes a blocked
+/// `NOTIFY_WAIT`er; needs no capability (the kernel/IRQ source is trusted, like any hardware event).
+fn notify_signal() {
+    NOTIFY.lock().signaled = true;
+}
+
+/// Whether a process is currently blocked in `NOTIFY_WAIT` — the demo's boot task signals once it
+/// sees the waiter has actually blocked (so the wake genuinely follows the signal).
+fn notify_has_waiter() -> bool {
+    NOTIFY.lock().waiter.is_some()
 }
 
 /// Handle a userspace fault (an EL0 access that trapped — a bug or a hostile raw pointer). The
@@ -726,4 +793,68 @@ pub fn run_server_demo() {
         "[praesidium] user: persistent server served 4 requests + STOP from ONE long-lived RECV-loop task (the P8/P9 server shape) and shut down gracefully"
     );
     kprintln!("[praesidium] PRAESIDIUM-SERVER-1-OK");
+}
+
+/// Bridge substrate.2: prove the `Notification` async-signal runtime (SIGNAL/WAIT) — the P9
+/// IRQ→driver wake path. A `waiter` process holds a WAIT-only `Notification` cap (kernel-installed)
+/// and blocks in `NOTIFY_WAIT`; once it has genuinely blocked, the KERNEL raises the notification
+/// ([`notify_signal`], the stand-in for a P9 in-kernel IRQ handler) and the waiter wakes. Proves a
+/// userspace principal sleeps until a kernel/hardware event, capability-gated (no ambient wakeups).
+/// Emits `PRAESIDIUM-NOTIFY-OK`.
+pub fn run_notify_demo() {
+    kprintln!(
+        "[praesidium] user: bridge substrate — Notification WAIT/SIGNAL (a userspace waiter woken by a kernel signal, the P9 IRQ->driver path)"
+    );
+    if !arch::el0_supported() {
+        kprintln!("[praesidium] user: EL0 not wired on this arch — skipping the notification demo");
+        return;
+    }
+    let mut loader = crate::loader::authority();
+    let mut scratch = crate::loader::L_SCRATCH;
+    let (entry, sp, space) =
+        load_process(&mut loader, &mut scratch, WAITER_PEX, DOMAIN_PING, PING, PING_STACK_VA, "waiter");
+    // Install the waiter's Notification cap (WAIT only — the kernel holds the signal side). The wake
+    // is thus capability-gated: a process with no Notification cap cannot be signalled (RI).
+    PROC_CSPACES.lock()[PING]
+        .as_mut()
+        .unwrap_or_else(|| fatal("notify: waiter CSpace missing"))
+        .install_notification(NOTIF_SLOT, NOTIF_ID, Rights::WAIT);
+    {
+        let mut n = NOTIFY.lock();
+        n.signaled = false;
+        n.waiter = None;
+    }
+
+    PROC_DONE[PING].store(false, Ordering::Release);
+    PROC_EXIT[PING].store(0, Ordering::Relaxed);
+    scheduler::spawn_proc(
+        // SAFETY: `entry` is loader-mapped EL0-executable code; `sp` the top of the waiter's stack.
+        move || unsafe { arch::enter_user(entry, sp, DOMAIN_PING) },
+        Budget::new(u32::MAX, u32::MAX),
+        PING,
+        DOMAIN_PING,
+        space,
+    );
+
+    // Drive until the waiter leaves EL0. Once it has genuinely BLOCKED in NOTIFY_WAIT (registered as
+    // the waiter), the kernel raises the notification exactly once — so the wake provably follows.
+    let mut signalled = false;
+    while !PROC_DONE[PING].load(Ordering::Acquire) {
+        if !signalled && notify_has_waiter() {
+            kprintln!("[praesidium] user: waiter BLOCKED in NOTIFY_WAIT — kernel raises the Notification (stand-in for a P9 IRQ)");
+            notify_signal();
+            signalled = true;
+        }
+        scheduler::yield_now();
+    }
+    if !signalled {
+        fatal("the waiter exited without ever blocking in NOTIFY_WAIT");
+    }
+    if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 {
+        fatal("the waiter did not exit cleanly after waking");
+    }
+    kprintln!(
+        "[praesidium] user: Notification WAIT/SIGNAL OK — the waiter slept until the kernel signalled, then woke (the P9 IRQ->driver wake path, capability-gated)"
+    );
+    kprintln!("[praesidium] PRAESIDIUM-NOTIFY-OK");
 }

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server|notify] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -289,6 +289,19 @@ const SERVER_REQUIRED: &[&str] = &[
     "PRAESIDIUM-SERVER-1-OK",
 ];
 
+/// Bridge substrate.2: the `Notification` async-signal runtime — a userspace waiter BLOCKS in
+/// NOTIFY_WAIT, the kernel raises the notification (a P9 IRQ stand-in), the waiter WAKES. Ordered
+/// markers (0x5a17 before the block, the kernel raise, 0xa1e after) prove the wake follows the signal.
+const NOTIFY_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-SERVER-1-OK",           // prior substrate increment booted
+    "waiter.pex loaded",
+    "EL0 syscall DEBUG value=0x5a17",   // the waiter ran and is about to WAIT
+    "waiter BLOCKED in NOTIFY_WAIT",    // it genuinely blocked; the kernel now raises the notification
+    "EL0 syscall DEBUG value=0xa1e",    // it WOKE — NOTIFY_WAIT returned after the kernel signal
+    "Notification WAIT/SIGNAL OK",
+    "PRAESIDIUM-NOTIFY-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -365,6 +378,13 @@ const SCENARIOS: &[Scenario] = &[
         // so pin the same deterministic TCG+max on x86 (the server processes are per-domain-isolated).
         x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
     },
+    Scenario {
+        name: "notify",
+        required: NOTIFY_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-NOTIFY-OK",
+        x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -395,7 +415,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server|notify] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -414,7 +434,7 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let use_tpm = !flag(args, "--no-tpm");
     let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "loader".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user, server)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user, server, notify)")
     })?;
     let (required, success): (&[&str], &str) = (sc.required, sc.success);
     // An x86 scenario pinned to TCG (the isolation `user` scenario) boots far slower than KVM, so
@@ -514,6 +534,9 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     // SEND+RECV (RECV to serve; SEND because DEBUG/EXIT are modelled as Endpoint sends in bring-up).
     let echod_pex = build_refproc(arch, "echod", "sendrecv", "0x94", Some("0x40100000"))?;
     let echocli_pex = build_refproc(arch, "echocli", "send", "0x95", Some("0x40300000"))?;
+    // Bridge substrate.2: `waiter` WAITs on a Notification the kernel signals (the P9 IRQ->driver
+    // wake path). SEND for DEBUG/EXIT; the kernel installs its Notification (WAIT) cap at run time.
+    let waiter_pex = build_refproc(arch, "waiter", "send", "0x96", None)?;
 
     eprintln!(
         "[xtask] building kernel for {} ({})",
@@ -527,6 +550,7 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
         .env("PRAESIDIUM_EVIL_PEX", &evil_pex)
         .env("PRAESIDIUM_ECHOD_PEX", &echod_pex)
         .env("PRAESIDIUM_ECHOCLI_PEX", &echocli_pex)
+        .env("PRAESIDIUM_WAITER_PEX", &waiter_pex)
         .args([
             "build",
             // build-std is passed here (not in .cargo/config.toml) so it applies only to the

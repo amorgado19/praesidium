@@ -139,6 +139,17 @@ pub fn raw_read(va: usize) -> u64 {
     unsafe { core::ptr::read_volatile(va as *const u64) }
 }
 
+/// The CSpace slot the kernel installs this process's `Notification` cap at (matches the kernel's
+/// `NOTIF_SLOT`); past the manifest (1=Sched, 2=Endpoint), Reply (3), and SharedRo (4).
+pub const NOTIF: u32 = 5;
+
+/// Block until this process's `Notification` is raised — by the kernel (a P9 IRQ) or a signaller.
+/// The wake carries no payload: returning from this call IS the signal (an async, capability-gated
+/// sleep-until-event, the shape a userspace driver's main loop takes).
+pub fn notify_wait() {
+    let _ = invoke(NOTIF, op::NOTIFY_WAIT, [0, 0, 0, 0]);
+}
+
 /// A panic in a reference process fails closed to `PROC_EXIT` with the sentinel error code — there
 /// is no serial or unwinding in userspace, so relinquishing the CPU is the only sane action.
 #[panic_handler]

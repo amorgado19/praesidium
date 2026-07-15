@@ -27,9 +27,9 @@ bitflags! {
         const RETYPE = 1 << 5;
         /// Send on an endpoint.
         const SEND = 1 << 6;
-        /// Receive on an endpoint / wait on a notification.
+        /// Receive on an endpoint.
         const RECV = 1 << 7;
-        /// Signal a notification.
+        /// Signal a notification (raise its async signal).
         const SIGNAL = 1 << 8;
         /// Derive/duplicate capabilities from this one (MINT/COPY authority).
         const DERIVE = 1 << 9;
@@ -38,6 +38,10 @@ bitflags! {
         /// domain's translation), so a principal can hold ENTER without ever being able to remap
         /// its own domain (which would be an isolation escape). Domain entry is never ambient.
         const ENTER = 1 << 10;
+        /// Wait on a `Notification` (block until its async signal is raised — SPEC-CAP §2). Distinct
+        /// from `RECV` (endpoint receive): a notification carries no payload, and the two authorities
+        /// name different object classes.
+        const WAIT = 1 << 11;
     }
 }
 

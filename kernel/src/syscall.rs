@@ -108,6 +108,29 @@ pub fn invoke<const N: usize>(cs: &CSpace<N>, inv: &Invocation) -> Result<u64, I
             Ok(u64::from(cap.aux) << 12)
         }
 
+        // Async signal (bridge substrate): WAIT (requires WAIT) / SIGNAL (requires SIGNAL) on a
+        // `Notification`. RI is enforced here (no cap / wrong right ⇒ refused); the block/raise EFFECT
+        // is applied by the caller (kernel::user), like the IPC rendezvous — a blocking wait cannot be
+        // expressed through this value-returning dispatch. Returns the notification's object id.
+        op::NOTIFY_WAIT => {
+            if cap.cap_type != CapType::Notification {
+                return Err(InvokeError::WrongType);
+            }
+            if !cap.rights.contains(Rights::WAIT) {
+                return Err(InvokeError::InsufficientRights);
+            }
+            Ok(cap.objref)
+        }
+        op::NOTIFY_SIGNAL => {
+            if cap.cap_type != CapType::Notification {
+                return Err(InvokeError::WrongType);
+            }
+            if !cap.rights.contains(Rights::SIGNAL) {
+                return Err(InvokeError::InsufficientRights);
+            }
+            Ok(cap.objref)
+        }
+
         _ => Err(InvokeError::UnknownOp),
     }
 }

@@ -90,6 +90,10 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     // serving a client — the foundation the P8 FS server + P9 driver servers build on.
     user::run_server_demo();
 
+    // Bridge substrate.2: the Notification async-signal runtime — a userspace waiter blocks until the
+    // kernel raises its notification (the P9 IRQ->driver wake path), capability-gated.
+    user::run_notify_demo();
+
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();
     arch::halt();

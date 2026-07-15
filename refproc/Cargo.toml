@@ -50,6 +50,12 @@ path = "src/echod.rs"
 name = "echocli"
 path = "src/echocli.rs"
 
+# Bridge substrate.2: a process that WAITs on a Notification the kernel signals (the P9 IRQ->driver
+# wake path) — a userspace principal sleeping until a hardware/kernel event, capability-gated.
+[[bin]]
+name = "waiter"
+path = "src/waiter.rs"
+
 [dependencies]
 abi = { path = "../abi" } # userspace touches the kernel ONLY through the ABI
 

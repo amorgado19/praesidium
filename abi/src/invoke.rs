@@ -75,6 +75,16 @@ pub mod op {
     /// it learns the window VA from the cap, not ambiently). No map operation is exposed; the
     /// co-mapping was done, privileged, at share-time — userspace never edits a page table.
     pub const SHARED_QUERY: u16 = 0x30;
+
+    /// **Async signal (bridge substrate, ADR-0004 DEC-0004-3).** WAIT on a `Notification`
+    /// (**requires `WAIT`**): block until the notification is raised (by a `NOTIFY_SIGNAL`, or by the
+    /// kernel — e.g. the P9 IRQ core signalling a driver), then consume the pending signal and
+    /// return. No payload — the wake IS the message. The block is a cooperative yield, so the CPU
+    /// runs other work while the waiter sleeps.
+    pub const NOTIFY_WAIT: u16 = 0x40;
+    /// SIGNAL a `Notification` (**requires `SIGNAL`**): raise it, waking a blocked [`NOTIFY_WAIT`]er
+    /// (or leaving the signal pending for the next wait). Fire-and-forget, no reply.
+    pub const NOTIFY_SIGNAL: u16 = 0x41;
 }
 
 /// A capability invocation: perform `op` on the capability at `cptr`, with `args`. The concrete
