@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -276,6 +276,19 @@ const USER_REQUIRED: &[&str] = &[
     "PRAESIDIUM-V1.1-A-OK",
 ];
 
+/// Bridge substrate.1: a PERSISTENT userspace server (`echod`, a RECV-serve loop) serves a client
+/// (`echocli`) MANY requests from ONE long-lived task — the shape P8/P9 servers take (vs one-shot).
+const SERVER_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-V1.1-A-OK",             // prior phases boot
+    "echod.pex loaded",                // the persistent server .pex loaded
+    "echocli.pex loaded",              // its client loaded
+    "EL0 syscall DEBUG value=0x101",   // request 1 served (echo of 0x100)
+    "EL0 syscall DEBUG value=0x104",   // request 4 served — proves the SAME task served many, not one-shot
+    "EL0 syscall DEBUG value=0xdead570a", // the STOP acknowledged (server shut down gracefully)
+    "persistent server served",        // the kernel's summary of the RECV-serve loop
+    "PRAESIDIUM-SERVER-1-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -343,6 +356,15 @@ const SCENARIOS: &[Scenario] = &[
         // exercised every run — not silently replaced by the fallback under a no-KVM CI.
         x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
     },
+    Scenario {
+        name: "server",
+        required: SERVER_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-SERVER-1-OK",
+        // Runs after the isolation scenario in the same boot; PKU/MTE + per-domain tables are live,
+        // so pin the same deterministic TCG+max on x86 (the server processes are per-domain-isolated).
+        x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -373,7 +395,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -392,7 +414,7 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let use_tpm = !flag(args, "--no-tpm");
     let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "loader".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user, server)")
     })?;
     let (required, success): (&[&str], &str) = (sc.required, sc.success);
     // An x86 scenario pinned to TCG (the isolation `user` scenario) boots far slower than KVM, so
@@ -487,6 +509,11 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     // P7b-ii red-team: the HOSTILE `evil` binary at its own base — raw-reads pong's segment
     // (0x40300000). It holds an Endpoint (SEND) only to report a breach; the read must fault first.
     let evil_pex = build_refproc(arch, "evil", "send", "0x93", Some("0x40500000"))?;
+    // Bridge substrate: the persistent echo SERVER (`echod`) + its client (`echocli`), sharing one
+    // Endpoint at distinct bases — proves a userspace RECV-serve loop serves many requests. echod is
+    // SEND+RECV (RECV to serve; SEND because DEBUG/EXIT are modelled as Endpoint sends in bring-up).
+    let echod_pex = build_refproc(arch, "echod", "sendrecv", "0x94", Some("0x40100000"))?;
+    let echocli_pex = build_refproc(arch, "echocli", "send", "0x95", Some("0x40300000"))?;
 
     eprintln!(
         "[xtask] building kernel for {} ({})",
@@ -494,10 +521,12 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     );
     let status = Command::new(&cargo)
         .current_dir(&root)
-        // The kernel `include_bytes!(env!("PRAESIDIUM_{PING,PONG,EVIL}_PEX"))` the packaged images.
+        // The kernel `include_bytes!(env!("PRAESIDIUM_{PING,PONG,EVIL,ECHOD,ECHOCLI}_PEX"))` them.
         .env("PRAESIDIUM_PING_PEX", &ping_pex)
         .env("PRAESIDIUM_PONG_PEX", &pong_pex)
         .env("PRAESIDIUM_EVIL_PEX", &evil_pex)
+        .env("PRAESIDIUM_ECHOD_PEX", &echod_pex)
+        .env("PRAESIDIUM_ECHOCLI_PEX", &echocli_pex)
         .args([
             "build",
             // build-std is passed here (not in .cargo/config.toml) so it applies only to the

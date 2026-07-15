@@ -39,6 +39,17 @@ path = "src/pong.rs"
 name = "evil"
 path = "src/evil.rs"
 
+# Bridge substrate: a PERSISTENT userspace server (`echod`, a RECV-serve loop) + its client
+# (`echocli`) — proves a userspace process can serve many requests, the shape the P8 FS server and
+# P9 driver servers take (unlike v1's one-shot ping/pong).
+[[bin]]
+name = "echod"
+path = "src/echod.rs"
+
+[[bin]]
+name = "echocli"
+path = "src/echocli.rs"
+
 [dependencies]
 abi = { path = "../abi" } # userspace touches the kernel ONLY through the ABI
 

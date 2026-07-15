@@ -92,6 +92,9 @@ const PING_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PING_PEX"));
 const PONG_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_PONG_PEX"));
 /// The HOSTILE red-team binary (P7b-ii / AC7.3): raw-reads pong's segment VA.
 const EVIL_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_EVIL_PEX"));
+/// Bridge substrate: the persistent echo SERVER + its client (a RECV-serve loop serving many requests).
+const ECHOD_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_ECHOD_PEX"));
+const ECHOCLI_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_ECHOCLI_PEX"));
 /// User-stack VAs (one page each), distinct from the processes' segments (ping @ 0x4010_0000, pong
 /// @ 0x4030_0000, evil @ 0x4050_0000) and each other — all inside the reserved window [1 GiB, 2 GiB).
 const PING_STACK_VA: u64 = 0x4020_0000;
@@ -655,4 +658,72 @@ fn run_redteam(loader: &mut CSpace<LOADER_SLOTS>, scratch: &mut Cptr, shared_pfn
         "[praesidium] user: v1.1 shared-region red-team CONTAINED — a hostile RO-window holder read the region but could NOT reach beyond it (per-domain tables map only the region); RO enforced"
     );
     kprintln!("[praesidium] PRAESIDIUM-V1.1-A-OK");
+}
+
+// ================================ Bridge substrate: persistent server ==============================
+
+/// Bridge substrate.1: prove a PERSISTENT userspace SERVER — the shape the P8 FS server and P9
+/// driver servers take. `echod` runs a RECV-serve LOOP (it services MANY requests from ONE
+/// long-lived task, unlike v1's one-shot ping/pong); `echocli` CALLs it several times + a STOP.
+/// Both load from ONE loader authority so they share the one Endpoint (echod RECV, echocli SEND).
+/// The KERNEL just loads + drives — the persistence lives entirely in echod's refproc loop, served
+/// by the P4 rendezvous, so no new kernel mechanism is needed here (that comes in substrate.2/.3:
+/// Notification + supervisor/restart). Reuses the process slots (ping/pong/evil have exited; each
+/// process still gets its OWN per-domain page table). Emits `PRAESIDIUM-SERVER-1-OK`.
+pub fn run_server_demo() {
+    kprintln!(
+        "[praesidium] user: bridge substrate — a PERSISTENT echo SERVER (echod, a RECV-serve loop) + client (echocli)"
+    );
+    if !arch::el0_supported() {
+        kprintln!("[praesidium] user: EL0 not wired on this arch — skipping the server demo");
+        return;
+    }
+    let mut loader = crate::loader::authority();
+    let mut scratch = crate::loader::L_SCRATCH;
+    // echod = SERVER (slot PING, RECV); echocli = CLIENT (slot PONG, SEND). Distinct bases so they
+    // coexist; ONE shared Endpoint (each cap derived from the one authority) carries the requests.
+    let (echod_entry, echod_sp, echod_space) =
+        load_process(&mut loader, &mut scratch, ECHOD_PEX, DOMAIN_PING, PING, PING_STACK_VA, "echod");
+    let (cli_entry, cli_sp, cli_space) = load_process(
+        &mut loader,
+        &mut scratch,
+        ECHOCLI_PEX,
+        DOMAIN_PONG,
+        PONG,
+        PONG_STACK_VA,
+        "echocli",
+    );
+
+    for id in [PING, PONG] {
+        PROC_DONE[id].store(false, Ordering::Release);
+        PROC_EXIT[id].store(0, Ordering::Relaxed);
+    }
+    scheduler::spawn_proc(
+        // SAFETY: `echod_entry` is loader-mapped EL0-executable code; `echod_sp` the top of its stack.
+        move || unsafe { arch::enter_user(echod_entry, echod_sp, DOMAIN_PING) },
+        Budget::new(u32::MAX, u32::MAX),
+        PING,
+        DOMAIN_PING,
+        echod_space,
+    );
+    scheduler::spawn_proc(
+        // SAFETY: as above, for the client.
+        move || unsafe { arch::enter_user(cli_entry, cli_sp, DOMAIN_PONG) },
+        Budget::new(u32::MAX, u32::MAX),
+        PONG,
+        DOMAIN_PONG,
+        cli_space,
+    );
+
+    // Drive until both leave EL0: the client after its requests + STOP, the server after the STOP.
+    while !(PROC_DONE[PING].load(Ordering::Acquire) && PROC_DONE[PONG].load(Ordering::Acquire)) {
+        scheduler::yield_now();
+    }
+    if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 || PROC_EXIT[PONG].load(Ordering::Relaxed) != 0 {
+        fatal("the persistent server or its client did not exit cleanly");
+    }
+    kprintln!(
+        "[praesidium] user: persistent server served 4 requests + STOP from ONE long-lived RECV-loop task (the P8/P9 server shape) and shut down gracefully"
+    );
+    kprintln!("[praesidium] PRAESIDIUM-SERVER-1-OK");
 }

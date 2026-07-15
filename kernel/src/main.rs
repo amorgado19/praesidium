@@ -86,6 +86,10 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     // processes, each resolving its own capabilities via the per-Task CSpace binding.
     user::run_processes();
 
+    // Bridge substrate: a PERSISTENT userspace server (a RECV-serve loop, not a one-shot process)
+    // serving a client — the foundation the P8 FS server + P9 driver servers build on.
+    user::run_server_demo();
+
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();
     arch::halt();
