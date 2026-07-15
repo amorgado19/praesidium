@@ -111,6 +111,16 @@ const ECHOD_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_ECHOD_PEX"));
 const ECHOCLI_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_ECHOCLI_PEX"));
 /// Bridge substrate.2: a process that WAITs on a Notification (the P9 IRQ→driver-wake path).
 const WAITER_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_WAITER_PEX"));
+/// Bridge substrate.3: a server that CRASHES on demand (`crashd`) + its client (`restartcli`) —
+/// proves the supervisor reaps + restarts a dead server transparently to the client.
+const CRASHD_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_CRASHD_PEX"));
+const RESTARTCLI_PEX: &[u8] = include_bytes!(env!("PRAESIDIUM_RESTARTCLI_PEX"));
+/// Isolation domain for the crash-restart demo processes: 0 (untagged / PKU key 0). This substrate
+/// exercises the process *lifecycle* + memory *reclaim*, not process-vs-process isolation (proven at
+/// P7b) — and domain 0 keeps the reaper's frame reclaim a clean buddy-free (no aarch64 MTE
+/// HHDM-alias restoration is owed for untagged frames). crashd and restartcli stay isolated anyway:
+/// each runs on its OWN per-domain page table, which maps only its own pages.
+const RESTART_DOMAIN: u64 = 0;
 /// The CSpace slot the kernel installs the waiter's `Notification` cap at (matches `refproc::NOTIF`);
 /// past the manifest (1=Sched, 2=Endpoint), Reply (3), and SharedRo (4) slots.
 const NOTIF_SLOT: Cptr = 5;
@@ -857,4 +867,158 @@ pub fn run_notify_demo() {
         "[praesidium] user: Notification WAIT/SIGNAL OK — the waiter slept until the kernel signalled, then woke (the P9 IRQ->driver wake path, capability-gated)"
     );
     kprintln!("[praesidium] PRAESIDIUM-NOTIFY-OK");
+}
+
+// ============================ Bridge substrate.3: supervisor + crash-restart + reaper =============
+
+/// Reset process `id`'s exit signal and spawn a `crashd` instance at `entry`/`sp` on its own `space`.
+fn spawn_crashd(id: usize, entry: u64, sp: u64, space: arch::AddressSpace) {
+    PROC_DONE[id].store(false, Ordering::Release);
+    PROC_EXIT[id].store(0, Ordering::Relaxed);
+    scheduler::spawn_proc(
+        // SAFETY: `entry` is loader-mapped EL0-executable code; `sp` the top of the process's stack.
+        move || unsafe { arch::enter_user(entry, sp, RESTART_DOMAIN) },
+        Budget::new(u32::MAX, u32::MAX),
+        id,
+        RESTART_DOMAIN,
+        space,
+    );
+}
+
+/// Bridge substrate.3: prove a SUPERVISOR that detects a server crash, REAPS the dead process's
+/// frames, and RESTARTS a fresh instance that transparently serves the client — the crash-recovery
+/// shape a P8 FS server / P9 driver server takes, and the close of the v1 "finished tasks leak their
+/// stack" reaper deferral. `crashd` (server, slot PING) serves the client, then faults + dies on a
+/// CRASH request; `restartcli` (client, slot PONG) calls around the crash. The kernel drive loop IS
+/// the supervisor: it detects crashd's death (`PROC_EXIT == u64::MAX`), REAPS it — returning its
+/// kernel stack + per-domain page-table clone + user-stack frame to the buddy, proven by free-frame
+/// CONSERVATION (the spawn footprint equals what the reaper returns) — and reloads a fresh `crashd`
+/// that serves the client's still-blocked request. Emits `PRAESIDIUM-RESTART-OK`.
+pub fn run_restart_demo() {
+    kprintln!(
+        "[praesidium] user: bridge substrate — SUPERVISOR: crash-detect + REAP + restart (closes the v1 reaper deferral)"
+    );
+    if !arch::el0_supported() {
+        kprintln!("[praesidium] user: EL0 not wired on this arch — skipping the restart demo");
+        return;
+    }
+    let mut loader = crate::loader::authority();
+    let mut scratch = crate::loader::L_SCRATCH;
+
+    // Conservation baseline (precise + robust): crashd's RECLAIMABLE buddy footprint is the
+    // page-table clone + user-stack frames that `load_process` allocates, PLUS the kernel-stack block
+    // (a KNOWN constant). We measure the LOAD delta directly and add the constant — NOT a delta across
+    // spawn — because `spawn`'s `install_guard_page` may split a permanent kernel HHDM table (a frame
+    // the reaper does NOT reclaim); folding the kernel stack in by measurement would let that one-off
+    // split inflate the footprint and spuriously fail the self-check below. The `.pex` segment frames
+    // are carved from the loader's monotonic Untyped (allocated in `authority()` before this
+    // baseline), so they are NOT in this footprint either. The reaper returns EXACTLY this footprint.
+    let free_before = memory::free_frame_count();
+    let (srv_entry, srv_sp, srv_space) = load_process(
+        &mut loader,
+        &mut scratch,
+        CRASHD_PEX,
+        RESTART_DOMAIN,
+        PING,
+        PING_STACK_VA,
+        "crashd",
+    );
+    let footprint = (free_before - memory::free_frame_count()) + scheduler::KERNEL_STACK_FRAMES;
+    spawn_crashd(PING, srv_entry, srv_sp, srv_space);
+
+    // The client drives the crash: req1 (served), CRASH (acked, then the server faults + dies), req2
+    // (BLOCKS until the supervisor restarts the server), STOP.
+    let (cli_entry, cli_sp, cli_space) = load_process(
+        &mut loader,
+        &mut scratch,
+        RESTARTCLI_PEX,
+        RESTART_DOMAIN,
+        PONG,
+        PONG_STACK_VA,
+        "restartcli",
+    );
+    PROC_DONE[PONG].store(false, Ordering::Release);
+    PROC_EXIT[PONG].store(0, Ordering::Relaxed);
+    scheduler::spawn_proc(
+        // SAFETY: `cli_entry` is loader-mapped EL0-executable code; `cli_sp` the top of its stack.
+        move || unsafe { arch::enter_user(cli_entry, cli_sp, RESTART_DOMAIN) },
+        Budget::new(u32::MAX, u32::MAX),
+        PONG,
+        RESTART_DOMAIN,
+        cli_space,
+    );
+
+    // The supervisor drive loop: drive until the server crashes; then REAP + RESTART it, and drive
+    // both the fresh server and the client to clean completion.
+    let mut restarted = false;
+    loop {
+        let srv_done = PROC_DONE[PING].load(Ordering::Acquire);
+        let cli_done = PROC_DONE[PONG].load(Ordering::Acquire);
+        if !restarted {
+            if srv_done {
+                // Instance 1 finished — it can only have done so by CRASHING (it exits cleanly only
+                // on STOP, which the client sends only AFTER the restart). Verify it was KILLED.
+                if PROC_EXIT[PING].load(Ordering::Relaxed) != u64::MAX {
+                    fatal("restart demo: the server exited cleanly before the crash — test invalid");
+                }
+                kprintln!(
+                    "[praesidium] user: SUPERVISOR detected crashd CRASHED (killed by fault) — reaping its frames, then restarting"
+                );
+                // REAP: return the dead crashd's kernel stack + per-domain page table + user-stack
+                // frame to the buddy, and assert frame CONSERVATION against the spawn footprint.
+                // `reap_finished` reaps the MOST-RECENT finished PING task (the slot is reused across
+                // demos, so older finished generations linger). This targets crashd instance 1 ONLY
+                // because it is already `Finished` by the time we observe `PROC_DONE[PING]`: the EL0
+                // fault → `retire` → `task_exit` (marks Finished) path runs IRQ-masked on a single CPU
+                // (x86 `#PF` interrupt gate clears IF; aarch64 sync-exception masks DAIF), so the
+                // supervisor cannot be scheduled in the `PROC_DONE.store` → `Finished` window. (If EL0
+                // is ever made preemptible, this exit path must mark Finished before signalling
+                // PROC_DONE, else the reap could target an older same-slot generation.)
+                let free_pre = memory::free_frame_count();
+                let space = scheduler::reap_finished(PING)
+                    .unwrap_or_else(|| fatal("restart: no finished crashd task to reap"));
+                // SAFETY: `space` is the dead crashd's space — its task is now Reaped (never scheduled
+                // again) and the supervisor runs on kernel_space (so `space` is not the active table);
+                // PING_STACK_VA names crashd's exclusively-owned, untagged (domain 0) user-stack leaf.
+                let reaped = unsafe { arch::reap_process_space(space, &[PING_STACK_VA]) };
+                let reclaimed = memory::free_frame_count() - free_pre;
+                if reclaimed != footprint {
+                    kprintln!(
+                        "[praesidium] FATAL: user: reaper broke frame conservation — spawn footprint {footprint}, reclaimed {reclaimed}"
+                    );
+                    arch::halt();
+                }
+                kprintln!(
+                    "[praesidium] user: REAPER conserved frames — spawn footprint {footprint} == reclaimed {reclaimed} ({reaped} page-table+leaf frames + the kernel stack); no leak, no over-free"
+                );
+                // RESTART: reload the SAME .pex fresh (a new page table + CSpace) into the same slot;
+                // the fresh instance RECVs the client's still-pending req2 over the shared Endpoint.
+                let (r_entry, r_sp, r_space) = load_process(
+                    &mut loader,
+                    &mut scratch,
+                    CRASHD_PEX,
+                    RESTART_DOMAIN,
+                    PING,
+                    PING_STACK_VA,
+                    "crashd(restarted)",
+                );
+                spawn_crashd(PING, r_entry, r_sp, r_space);
+                restarted = true;
+                kprintln!(
+                    "[praesidium] user: crashd RESTARTED — a fresh instance now serves the client's blocked request"
+                );
+            }
+        } else if srv_done && cli_done {
+            break;
+        }
+        scheduler::yield_now();
+    }
+
+    if PROC_EXIT[PING].load(Ordering::Relaxed) != 0 || PROC_EXIT[PONG].load(Ordering::Relaxed) != 0 {
+        fatal("restart demo: the restarted server or the client did not exit cleanly");
+    }
+    kprintln!(
+        "[praesidium] user: crash-restart TRANSPARENT to the client — it got req1, the crash ack, then req2 served by the RESTARTED server, and STOP (it never learned the server died)"
+    );
+    kprintln!("[praesidium] PRAESIDIUM-RESTART-OK");
 }

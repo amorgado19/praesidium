@@ -34,23 +34,34 @@ const PAGE: usize = 4096;
 /// ADR-0008 — closing the P3b/P4 "guard pages below task stacks" deferral).
 const GUARDED_STACK_ORDER: u8 = 3;
 const BLOCK_BYTES: usize = (1 << GUARDED_STACK_ORDER) * PAGE;
+/// Frames in a task's kernel-stack block — exactly what [`reap_finished`] returns to the buddy for a
+/// reaped task. Exported so the bridge-substrate conservation proof can account the kernel stack as a
+/// KNOWN constant rather than a spawn-time free-count delta: `spawn_inner` also does an
+/// [`arch::install_guard_page`] that may split an HHDM huge page (a one-off *permanent kernel* table
+/// frame the reaper does NOT reclaim), so folding the kernel stack in by measurement would let that
+/// split perturb the footprint. Counting it as this constant excludes the guard split structurally.
+pub const KERNEL_STACK_FRAMES: u64 = 1 << GUARDED_STACK_ORDER;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     /// Eligible to run (subject to budget).
     Runnable,
-    /// Body returned; never scheduled again (stack leaked until a reaper exists — P-later).
+    /// Body returned or the process was killed; never scheduled again. Its resources are still
+    /// held until [`reap_finished`] reclaims them (its kernel stack + per-domain page table).
     Finished,
+    /// Reaped: its kernel stack + page-table frames have been freed and it holds nothing more. An
+    /// inert tombstone (kept so `current` indices stay stable), never scheduled — [`pick_next`] and
+    /// [`runnable_besides`] skip it like any non-`Runnable` state.
+    Reaped,
 }
 
 /// A stackful scheduling context (SPEC-CAP `Task`): a saved register context, its own kernel
 /// stack, a CPU-time budget, and the body it runs on first schedule.
 struct Task {
     context: Context,
-    /// Physical base of the stack frames (`None` for the bootstrap/idle task, which runs on the
-    /// kernel `BOOT_STACK`). Held for a future stack-reclaiming reaper — finished tasks leak
-    /// their stack today (P-later).
-    #[allow(dead_code)]
+    /// Physical base of the guarded stack *block* (`None` for the bootstrap/idle task, which runs
+    /// on the kernel `BOOT_STACK`, and for an already-reaped task). [`reap_finished`] restores the
+    /// guard page's HHDM alias and returns this block to the buddy when the task is reaped.
     stack_phys: Option<u64>,
     budget: Budget,
     state: State,
@@ -335,6 +346,48 @@ fn task_exit() -> ! {
             }
         }
     }
+}
+
+/// Reap the MOST-RECENTLY-spawned `Finished` task bound to userspace process `proc_id` (bridge
+/// substrate.3 — closes the v1 "finished tasks leak their stack" deferral): return its kernel stack
+/// **block** to the buddy (restoring the guard page's HHDM alias first — [`spawn_inner`] unmapped
+/// it), mark the task `Reaped` so it is never scheduled or double-reaped, and hand its address
+/// `space` back to the caller so the arch layer can reclaim the per-domain page-table frames +
+/// user-leaf frames. Returns `None` if no such finished task exists.
+///
+/// **Last-match, not first:** a process *slot* (`proc_id`) is reused across demos, so several older
+/// finished generations of the same slot may still be unreaped — the supervisor wants the one it just
+/// saw die (the current occupant it is about to restart), which is the most recently spawned, hence
+/// [`Iterator::rposition`].
+///
+/// Safe to call from the boot/supervisor task while the dead task's `space` is **not** active: a
+/// `Finished` task is never switched to again, so its saved context + kernel stack are dead, and the
+/// supervisor task always runs on [`arch::kernel_space`] (so the freed root is never the live one).
+pub fn reap_finished(proc_id: usize) -> Option<AddressSpace> {
+    let (block, space) = with_sched(|s| {
+        let i = s
+            .tasks
+            .iter()
+            .rposition(|t| t.proc_id == Some(proc_id) && t.state == State::Finished)?;
+        let block = s.tasks[i].stack_phys.take();
+        let space = s.tasks[i].space;
+        s.tasks[i].state = State::Reaped;
+        Some((block, space))
+    })?;
+    // Reclaim the kernel stack outside the scheduler lock (frame ops take the allocator lock). The
+    // usable stack sits at the top of the block; the guard is the frame directly below it (see
+    // `spawn_inner`).
+    if let Some(block) = block {
+        let stack_base_phys = block + (BLOCK_BYTES - STACK_BYTES) as u64;
+        let guard_phys = stack_base_phys - PAGE as u64;
+        // SAFETY: `spawn_inner` unmapped this guard frame's HHDM alias to catch stack overflow;
+        // restore it RW before the block returns to the buddy, else a later `alloc_zeroed_frame`
+        // would fault zeroing that frame through the (still non-present) HHDM alias. The guard frame
+        // is inside our own block, so remapping its alias affects only this allocation.
+        unsafe { arch::map_page(memory::phys_to_virt(guard_phys), guard_phys, arch::Prot::Rw) };
+        memory::free_frames(block);
+    }
+    Some(space)
 }
 
 /// Charge one tick of CPU time to the running task and return whether it should be preempted

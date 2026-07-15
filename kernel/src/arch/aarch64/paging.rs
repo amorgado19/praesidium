@@ -13,7 +13,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{AddressSpace, KernelMap, Prot};
-use crate::memory::{alloc_zeroed_frame, phys_to_virt};
+use crate::memory::{alloc_zeroed_frame, free_frames, phys_to_virt};
 
 /// The pristine kernel base roots (`TTBR1` = HHDM + kernel high half; `TTBR0` = identity low half,
 /// **NO user process pages**), captured by [`build_address_space`]. Each userspace process runs on
@@ -199,6 +199,59 @@ pub fn new_process_space() -> AddressSpace {
         primary: KERNEL_TTBR1.load(Ordering::Relaxed),
         secondary: new_l0,
     }
+}
+
+/// Reap a dead process's per-domain page table (bridge substrate.3): free the private low-half
+/// (`TTBR0`) sub-tree that [`new_process_space`] + [`map_user_page`] allocated — the cloned L0, the
+/// private L1, the window L2, and every split L3 leaf table in that L2 — plus the explicitly listed
+/// exclusively-owned leaf frames (`owned_leaf_vas`, e.g. the user stack). Returns the frames freed.
+///
+/// **The shared kernel high half is `space.primary` (`TTBR1`) — it is NEVER touched here.** Only the
+/// private `space.secondary` (`TTBR0`) sub-tree is reclaimed. A 2 MiB L2 BLOCK descriptor is the
+/// shared EL1-only identity mapping (skipped); `.pex` segment leaves are NOT freed (they belong to
+/// the loader's monotonic `Untyped`), so `owned_leaf_vas` must list only true buddy allocations.
+///
+/// # Safety
+/// `space` must be a dead process's space from [`new_process_space`] that is NOT the active `TTBR0`
+/// and whose task will never be scheduled again (Finished/Reaped). Each `owned_leaf_vas` entry must
+/// name a 4 KiB leaf the process EXCLUSIVELY owns (a buddy frame, mapped untagged — domain 0 — so no
+/// MTE HHDM-alias restoration is owed); never a shared or `Untyped`-owned frame.
+pub unsafe fn reap_process_space(space: AddressSpace, owned_leaf_vas: &[u64]) -> u32 {
+    let l0 = space.secondary; // private TTBR0 root (primary = shared TTBR1 kernel high half — leave it)
+    let l1 = read_entry(l0, 0) & ADDR_MASK; // L0[0] -> private low L1 (identity + window)
+    let l2 = read_entry(l1, 1) & ADDR_MASK; // L1[1] -> private window L2 covering [1 GiB, 2 GiB)
+    let mut freed = 0u32;
+    // (1) Free the explicitly-owned leaf frames (the user stack), read THROUGH their L3 tables before
+    //     the tables themselves are freed in (2).
+    // NOTE (P8/P9 reuse): this frees the frame WITHOUT restoring its HHDM alias to `ATTR_NORMAL`.
+    // That is sound ONLY for a domain-0 (untagged) process — the substrate.3 case. A process in a
+    // non-zero domain has `map_user_page` leave the frame's HHDM alias Normal-Tagged, so returning it
+    // as-is would Data-Abort the next tag-0 HHDM access after realloc. Before reaping a TAGGED server,
+    // restore each freed leaf's HHDM alias to ATTR_NORMAL here (a `map_tagged`-inverse).
+    for &va in owned_leaf_vas {
+        let e2 = read_entry(l2, lidx(va, 2));
+        if e2 & VALID != 0 && e2 & 0b11 == TABLE {
+            let leaf = read_entry(e2 & ADDR_MASK, lidx(va, 3));
+            if leaf & VALID != 0 {
+                free_frames(leaf & ADDR_MASK);
+                freed += 1;
+            }
+        }
+    }
+    // (2) Free every private split L3 leaf table in the window L2 (a TABLE descriptor). A 2 MiB BLOCK
+    //     is the shared identity mapping — never this process's frame.
+    for i in 0..512 {
+        let e = read_entry(l2, i);
+        if e & VALID != 0 && e & 0b11 == TABLE {
+            free_frames(e & ADDR_MASK);
+            freed += 1;
+        }
+    }
+    // (3) Free the three private tables the clone itself allocated.
+    free_frames(l2);
+    free_frames(l1);
+    free_frames(l0);
+    freed + 3
 }
 
 /// Switch to the built address space (loads TTBR0/TTBR1), reusing Warden's TCR/MAIR.

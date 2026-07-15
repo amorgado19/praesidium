@@ -11,7 +11,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{AddressSpace, KernelMap, Prot};
-use crate::memory::{alloc_zeroed_frame, phys_to_virt};
+use crate::memory::{alloc_zeroed_frame, free_frames, phys_to_virt};
 
 /// The pristine kernel base PML4 (kernel image + identity + HHDM, **NO user process pages**),
 /// captured when [`build_address_space`] builds it. Each userspace process runs on its OWN page
@@ -179,6 +179,55 @@ pub fn new_process_space() -> AddressSpace {
         primary: new_pml4,
         secondary: 0,
     }
+}
+
+/// Reap a dead process's per-domain page table (bridge substrate.3): free the private window
+/// sub-tree that [`new_process_space`] + [`map_user_page`] allocated for this process — the cloned
+/// PML4, the private low-half PDPT, the window PD, and every split-leaf PT in that PD — plus the
+/// explicitly listed exclusively-owned leaf frames (`owned_leaf_vas`, e.g. the user stack). Returns
+/// the number of frames freed.
+///
+/// What is deliberately **left alone**: a 2 MiB HUGE PD entry is the SHARED supervisor identity
+/// mapping (not a buddy allocation of this process) — skipped; the kernel high half + low identity
+/// hang off other PML4/PDPT entries whose *frames* are never freed (only the private clones are);
+/// and `.pex` segment leaves are NOT freed (they are carved from the loader's monotonic `Untyped`,
+/// not the buddy's to return) — so `owned_leaf_vas` must list only true buddy allocations.
+///
+/// # Safety
+/// `space` must be a dead process's space from [`new_process_space`] that is NOT the active CR3 and
+/// whose task will never be scheduled again (Finished/Reaped). Each `owned_leaf_vas` entry must name
+/// a 4 KiB leaf the process EXCLUSIVELY owns (a buddy frame) — never a shared or `Untyped`-owned frame.
+pub unsafe fn reap_process_space(space: AddressSpace, owned_leaf_vas: &[u64]) -> u32 {
+    let pml4 = space.primary;
+    let pdpt = read_entry(pml4, 0) & ADDR_MASK; // PML4[0] -> private low-half PDPT (identity + window)
+    let pd = read_entry(pdpt, 1) & ADDR_MASK; // PDPT[1] -> private window PD covering [1 GiB, 2 GiB)
+    let mut freed = 0u32;
+    // (1) Free the explicitly-owned leaf frames (the user stack), read THROUGH their PTs before the
+    //     PTs themselves are freed in (2) — no use-after-free (leaf frame ≠ PT frame).
+    for &va in owned_leaf_vas {
+        let e2 = read_entry(pd, idx(va, 1));
+        if e2 & PRESENT != 0 && e2 & HUGE == 0 {
+            let leaf = read_entry(e2 & ADDR_MASK, idx(va, 0));
+            if leaf & PRESENT != 0 {
+                free_frames(leaf & ADDR_MASK);
+                freed += 1;
+            }
+        }
+    }
+    // (2) Free every private split-leaf PT in the window PD (base-privatized clones + on-demand
+    //     splits). A HUGE entry is the shared identity 2 MiB page — never this process's frame.
+    for i in 0..512 {
+        let e = read_entry(pd, i);
+        if e & PRESENT != 0 && e & HUGE == 0 {
+            free_frames(e & ADDR_MASK);
+            freed += 1;
+        }
+    }
+    // (3) Free the three private tables the clone itself allocated.
+    free_frames(pd);
+    free_frames(pdpt);
+    free_frames(pml4);
+    freed + 3
 }
 
 /// Switch to the built address space (loads CR3 from `space.primary`).

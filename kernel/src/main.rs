@@ -94,6 +94,10 @@ pub(crate) extern "C" fn kmain(bootinfo: *const WardenBootInfo) -> ! {
     // kernel raises its notification (the P9 IRQ->driver wake path), capability-gated.
     user::run_notify_demo();
 
+    // Bridge substrate.3: the supervisor — detect a server crash, REAP the dead process's frames
+    // (closing the v1 reaper deferral, proven by frame conservation), and RESTART it transparently.
+    user::run_restart_demo();
+
     // Ensure all serial/MMIO writes have completed before we park the CPU.
     arch::memory_barrier();
     arch::halt();

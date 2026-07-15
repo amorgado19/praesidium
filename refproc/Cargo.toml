@@ -56,6 +56,17 @@ path = "src/echocli.rs"
 name = "waiter"
 path = "src/waiter.rs"
 
+# Bridge substrate.3: a server that CRASHES on demand (`crashd`) + its client (`restartcli`) — proves
+# the kernel supervisor detects the death, REAPS the process's frames, and RESTARTS a fresh instance
+# that transparently serves the client (the shape a P8 FS / P9 driver server's crash-recovery takes).
+[[bin]]
+name = "crashd"
+path = "src/crashd.rs"
+
+[[bin]]
+name = "restartcli"
+path = "src/restartcli.rs"
+
 [dependencies]
 abi = { path = "../abi" } # userspace touches the kernel ONLY through the ABI
 

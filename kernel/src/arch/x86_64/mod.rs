@@ -17,7 +17,7 @@ pub use interrupts::{contains_raw_read, interrupts_init};
 pub use paging::{
     activate_address_space, build_address_space, build_domain_excluding, enable_wx,
     install_guard_page, kernel_space, map_page, map_user_page, new_process_space, page_prot,
-    sync_instruction_cache, translate,
+    reap_process_space, sync_instruction_cache, translate,
 };
 pub use pku::set_domain;
 pub use timer::timer_init;

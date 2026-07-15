@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask build --arch <x86_64|aarch64>
-//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server|notify] [--no-tpm] [--timeout N]
+//! cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server|notify|restart] [--no-tpm] [--timeout N]
 //! ```
 //!
 //! `build` compiles the bare-metal kernel image (build-std, the linker script, and
@@ -302,6 +302,22 @@ const NOTIFY_REQUIRED: &[&str] = &[
     "PRAESIDIUM-NOTIFY-OK",
 ];
 
+/// Bridge substrate.3: the SUPERVISOR — a server (`crashd`) faults on demand; the kernel detects the
+/// death, REAPS its frames (proven by free-frame conservation), and RESTARTS a fresh instance that
+/// transparently serves the client (`restartcli`). `0x201` served AFTER the crash is the payoff.
+const RESTART_REQUIRED: &[&str] = &[
+    "PRAESIDIUM-NOTIFY-OK",                 // the prior substrate increment booted
+    "crashd.pex loaded",                    // the crashable server loaded
+    "restartcli.pex loaded",               // its client loaded
+    "EL0 syscall DEBUG value=0x101",        // req1 served by instance 1 (echo of 0x100)
+    "SUPERVISOR detected crashd CRASHED",   // the fault was detected as a crash
+    "REAPER conserved frames",              // spawn footprint == reclaimed — no leak, no over-free
+    "crashd RESTARTED",                     // a fresh instance was launched
+    "EL0 syscall DEBUG value=0x201",        // req2 served by the RESTARTED server (echo of 0x200)
+    "crash-restart TRANSPARENT to the client",
+    "PRAESIDIUM-RESTART-OK",
+];
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "p0-rich",
@@ -385,6 +401,15 @@ const SCENARIOS: &[Scenario] = &[
         success: "PRAESIDIUM-NOTIFY-OK",
         x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
     },
+    Scenario {
+        name: "restart",
+        required: RESTART_REQUIRED,
+        forbidden: FORBIDDEN,
+        success: "PRAESIDIUM-RESTART-OK",
+        // Runs after the isolation scenarios in the same boot (per-domain tables + EL0 live), so pin
+        // the same deterministic TCG+max on x86 as server/notify.
+        x86_machine: Some(&["-machine", "accel=tcg", "-cpu", "max"]),
+    },
 ];
 
 fn scenario(name: &str) -> Option<&'static Scenario> {
@@ -415,7 +440,7 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask build --arch <x86_64|aarch64>\n  \
-         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server|notify] [--no-tpm] [--timeout <secs>]"
+         cargo xtask smoke --arch <x86_64|aarch64> [--scenario p0-rich|mem|cap|sched|preempt|ipc|isolation|loader|user|server|notify|restart] [--no-tpm] [--timeout <secs>]"
     );
 }
 
@@ -434,7 +459,7 @@ fn cmd_smoke(args: &[String]) -> Result<bool, String> {
     let use_tpm = !flag(args, "--no-tpm");
     let scenario_name = arg_value(args, "--scenario").unwrap_or_else(|| "loader".into());
     let sc = scenario(&scenario_name).ok_or_else(|| {
-        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user, server, notify)")
+        format!("unknown --scenario {scenario_name} (have: p0-rich, mem, cap, sched, preempt, ipc, isolation, loader, user, server, notify, restart)")
     })?;
     let (required, success): (&[&str], &str) = (sc.required, sc.success);
     // An x86 scenario pinned to TCG (the isolation `user` scenario) boots far slower than KVM, so
@@ -537,6 +562,11 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
     // Bridge substrate.2: `waiter` WAITs on a Notification the kernel signals (the P9 IRQ->driver
     // wake path). SEND for DEBUG/EXIT; the kernel installs its Notification (WAIT) cap at run time.
     let waiter_pex = build_refproc(arch, "waiter", "send", "0x96", None)?;
+    // Bridge substrate.3: `crashd` (SEND+RECV — a server that faults on demand) + `restartcli` (SEND
+    // — its client), sharing one Endpoint at distinct bases. The kernel supervisor reaps + restarts a
+    // crashed `crashd`; the client's next request is served by the restarted instance, transparently.
+    let crashd_pex = build_refproc(arch, "crashd", "sendrecv", "0x97", Some("0x40100000"))?;
+    let restartcli_pex = build_refproc(arch, "restartcli", "send", "0x98", Some("0x40300000"))?;
 
     eprintln!(
         "[xtask] building kernel for {} ({})",
@@ -551,6 +581,8 @@ fn build_kernel(arch: &ArchSpec) -> Result<PathBuf, String> {
         .env("PRAESIDIUM_ECHOD_PEX", &echod_pex)
         .env("PRAESIDIUM_ECHOCLI_PEX", &echocli_pex)
         .env("PRAESIDIUM_WAITER_PEX", &waiter_pex)
+        .env("PRAESIDIUM_CRASHD_PEX", &crashd_pex)
+        .env("PRAESIDIUM_RESTARTCLI_PEX", &restartcli_pex)
         .args([
             "build",
             // build-std is passed here (not in .cargo/config.toml) so it applies only to the

@@ -92,6 +92,17 @@ pub fn free_frames(pa: u64) {
     }
 }
 
+/// The number of physical frames currently free in the buddy (0 before [`init`]). Used by the
+/// bridge-substrate reaper to prove frame **conservation** — a spawn's buddy footprint equals what
+/// the reaper returns on process death (no leak, no over-free).
+#[must_use]
+pub fn free_frame_count() -> u64 {
+    FRAMES
+        .lock()
+        .as_ref()
+        .map_or(0, |fa| u64::from(fa.buddy.free_frames()))
+}
+
 /// Zero exactly one frame through the HHDM.
 pub fn zero_frame(pa: u64) {
     zero_range(pa, PAGE_SIZE);

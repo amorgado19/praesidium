@@ -23,8 +23,8 @@ pub use user::{el0_fault_blob, el0_supported, el0_test_blob, enter_user, set_ker
 pub const PEX_ARCH: u16 = abi::pex::ARCH_AARCH64;
 pub use paging::{
     activate_address_space, build_address_space, enable_wx, install_guard_page, kernel_space,
-    map_page, map_user_page, new_process_space, page_prot, set_domain, sync_instruction_cache,
-    translate,
+    map_page, map_user_page, new_process_space, page_prot, reap_process_space, set_domain,
+    sync_instruction_cache, translate,
 };
 
 /// The active process-vs-process **hostile-isolation** mechanism (P7b-ii, ISO-AC4 honesty). The red
